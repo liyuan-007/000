@@ -1,0 +1,3068 @@
+// @version=6
+indicator(
+ title = "TitanGrid L/S SuperEngine",
+ shorttitle = "TitanGrid",
+ overlay = true,
+ max_labels_count = 500,
+ max_lines_count = 500,
+ max_bars_back = 5000,
+ format = format.price,
+ precision = 6,
+ behind_chart = false
+ )
+TradeMode = input.string("Dual-Side", "Trade Mode", options = ["Long", "Short", "Dual-Side"], group = "GRID",
+     tooltip = "Select which type of trades are allowed:\n\n" +
+          "• Long → Only Long entries and exits are allowed.\n" +
+          "• Short → Only Short entries and exits are allowed.\n" +
+          "• Dual-Side → Both Long and Short entries are active.\n\n" +
+          "Stop Loss System:\n" +
+          "A static Stop Loss is placed at a fixed distance based on the configured Grid Width (%).\n" +
+          "Position sizing is calculated relative to this predefined risk distance.\n\n" +
+          "Dynamic Exit Override:\n" +
+          "If the price closes beyond the trend filter (SuperTrend), and the static Stop Loss has not yet been hit,\n" +
+          "the system will force a full position close based on trend reversal logic.\n" +
+          "This ensures exit discipline even when stop distance is wide.\n\n" +
+          "The Stop Loss logic is consistent across all trade modes and always respects trend structure.")
+
+AllowLongs = TradeMode != "Short"
+AllowShorts = TradeMode != "Long"
+Width = input.float(1, "Grid Width %", minval = 0.25, step = 0.25, group = "GRID",
+     tooltip="Distance between grid levels, expressed as a percentage of price.\nThis value defines dynamic stop-loss offset as well.")
+superTrendLength = input.int(30, "SuperTrend ATR Period", minval = 20, step = 5, group = "GRID",
+     tooltip="Sets the number of bars over which the Average True Range (ATR) is calculated.\nA larger value smooths the SuperTrend but reduces sensitivity to short-term moves.")
+superTrendMultiplier = input.float(3, "SuperTrend Multiplier", minval = 1.0, step = 0.25, group = "GRID",
+     tooltip="Sets how many times the ATR is multiplied to create the SuperTrend bands.\nA larger multiplier widens the bands, reducing the frequency of trend reversals.")
+CloseType = input.string("Progressive ", "Exit Scaling Method",
+     ["Equal", "Progressive "], group = "RISK",
+     tooltip="Select how to scale out of a position:\n- Equal: Even-sized exits.\n- Progressive: Larger closes as price moves in favor.")
+RiskPctPerTrade = input.float(1, "Risk % Per Trade", minval = 0.1, maxval = 100, step = 0.5, group="RISK",
+     tooltip="If 'Risk % Based' is selected, this sets the total percentage of capital to risk across all entries.")
+LeverageMultiplier = input.int(10, "Leverage Multiplier (1x-100x)", minval=1, maxval=100, group="RISK",
+     tooltip="1x = Spot mode\n>1x = Margin or Futures.\nUsed for liquidation estimation and available capital calculations.")
+MaxEntries = input.int(2, "Max Entries per Side", minval = 1, maxval = 5, group = "POSITIONS",
+     tooltip="Maximum number of entries allowed during a scaling-in cycle per side (Long or Short).")
+MaxCloseLevels = input.int(5, "Max Close Levels per Side", minval = 1, maxval = 5, group = "POSITIONS",
+     tooltip="Maximum number of partial Close targets per position on both Long and Short sides.")
+InitialCapital = input.float(10000.0, "Initial Capital", group = "TRADING",
+     tooltip="Initial account size, used for internal PnL and risk calculations.")
+TakerFee = input.float(0.06, "Taker Fee (%)", minval = 0, maxval = 1, step = 0.01, group="TRADING",
+     tooltip="Fee applied to market or aggressive orders that remove liquidity.\n\n" +
+         "Typical Values by Asset:\n" +
+         "• Crypto (Bitget, Binance): 0.05-0.08%\n" +
+         "• Forex (OANDA, FXCM): 0.00-0.02% (spread-based)\n" +
+         "• Stocks (Interactive Brokers): 0.01-0.05%\n" +
+         "• Futures (CME, Binance): 0.01-0.04%\n\n" +
+         "Tip: Use lower values for Maker/Limit orders and higher values for Taker/Market.") / 100
+MakerFee = input.float(0.02, "Maker Fee (%)", minval = 0, maxval = 1, step = 0.01, group = "TRADING",
+     tooltip="Fee applied to limit or passive orders that add liquidity.\n\n" +
+             "Typical Values by Asset:\n" +
+             "• Crypto (Bitget, Binance): 0.01-0.03%\n" +
+             "• Forex (OANDA, FXCM): 0.00% (spread-based)\n" +
+             "• Stocks (Interactive Brokers): 0.00-0.02%\n" +
+             "• Futures (CME, Binance): 0.00-0.01%\n\n" +
+             "Tip: Maker orders often have rebates or near-zero fees.") / 100
+FundingFeeRate8H = input.float(0.02, "Funding Rate per 8H (%)", minval = 0, maxval = 1, step = 0.01, group = "TRADING",
+     tooltip =
+         "Estimated funding cost charged every 8 hours as a % of position value.\n" +
+         "Typical range: 0.01% to 0.05%.\n" +
+         "This will be distributed proportionally per candle based on chart resolution.\n" +
+         "This is automatically disabled (set to 0%) when the asset is not crypto.") / 100
+isCrypto = syminfo.type == "crypto"
+FundingFeeRate8H := isCrypto ? FundingFeeRate8H : 0.0
+StartDate = timestamp("01 Jan 1970 00:00 +000")
+testPeriodStart = input.time(StartDate, "Start of Trading", group = "TRADING",
+     tooltip="Start date of strategy execution. Trades before this timestamp are ignored.")
+PanelSizeInput = input.string("Tiny", "Panel Size",
+     ["Auto", "Tiny", "Small", "Normal", "Large", "Huge"], group = "PLOTTING",
+     tooltip="Sets the size for the real-time dashboard panel only.\nAdjust for visual clarity depending on screen resolution.")
+LabelSizeInput = input.string("Tiny", "Label Size",
+     ["Auto", "Tiny", "Small", "Normal", "Large", "Huge"], group = "PLOTTING",
+     tooltip="Sets the size for chart price markers and trade labels.\nDoes not affect the dashboard panel.")
+ShowPanel = input.bool(true, "Show Info Panel", group ="PLOTTING",
+     tooltip="Toggles display of the real-time trading dashboard with PnL and risk data.")
+var float FirstLongPrice = na
+// First executed Short price
+var float FirstShortPrice = na
+
+// Timestamp of first Long
+var int FirstLongTime = na
+// Timestamp of first Short
+var int FirstShortTime = na
+
+// Executed Long entry prices array
+var float[] LongPrices = array.new_float(0)
+// Executed Short entry prices array
+var float[] ShortPrices = array.new_float(0)
+
+// Executed CloseLong exit prices array
+var float[] CloseLongPrices = array.new_float(0)
+// Executed CloseShort exit prices array
+var float[] CloseShortPrices = array.new_float(0)
+
+// Active Long limit orders array
+var float[] LongLimitPrices = array.new_float(0)
+// Active Short limit orders array
+var float[] ShortLimitPrices = array.new_float(0)
+
+// Active CloseLong limit orders array
+var float[] CloseLongLimitPrices = array.new_float(0)
+// Active CloseShort limit orders array
+var float[] CloseShortLimitPrices = array.new_float(0)
+
+// Arrays for executed Longs (price and bar index)
+var int[] LongBarIndexes = array.new_int()
+// Arrays for executed Shorts (price and bar index)
+var int[] ShortBarIndexes = array.new_int()
+
+// Active Long entries counter
+var int nLongs = 0
+// Active Short entries counter
+var int nShorts = 0
+
+// Active CloseLong exits counter
+var int nCloseLongs = 0
+// Active CloseShort exits counter
+var int nCloseShorts = 0
+
+// Declare bar index for Long trades
+// Stores the bar index when a Long trade is executed
+var int barIndexLong = na
+
+// Declare bar index for CloseLong trades
+// Stores the bar index when a CloseLong trade is executed
+var int barIndexCloseLong = na
+
+// Declare bar index for Short trades
+// Stores the bar index when a Short trade is executed
+var int barIndexShort = na
+
+// Declare bar index for CloseShort trades
+// Stores the bar index when a CloseShort trade is executed
+var int barIndexCloseShort = na
+
+// Declare bar index for StopLossLong triggers
+// Stores the bar index when a StopLossLong is hit
+var int barIndexStopLossLong = na
+
+// Declare bar index for StopLossShort triggers
+// Stores the bar index when a StopLossShort is hit
+var int barIndexStopLossShort = na
+
+// Total Longs executed counter
+var int TotalLongsExecuted = 0
+// Total Shorts executed counter
+var int TotalShortsExecuted = 0
+
+// Total CloseLongs executed counter
+var int TotalClosesExecuted = 0
+// Total CloseShorts executed counter
+var int TotalShortClosesExecuted = 0
+
+// Track the number of winning trades (PnL > 0)
+var float nWins = 0
+// Track the number of losing trades (PnL < 0)
+var float nLosses = 0
+
+// Quantities per executed Long array
+var float[] LongQuantities = array.new_float(0)
+// Quantities per executed Short array
+var float[] ShortQuantities = array.new_float(0)
+
+// Cash used per executed Long array
+var float[] LongAmounts = array.new_float(0)
+// Cash used per executed Short array
+var float[] ShortAmounts = array.new_float(0)
+
+// Quantities per executed CloseLong array
+var float[] CloseLongQuantities = array.new_float(0)
+// Quantities per executed CloseShort array
+var float[] CloseShortQuantities = array.new_float(0)
+
+// Cash received per executed CloseLong array
+var float[] CloseLongAmounts = array.new_float(0)
+// Cash received per executed CloseShort array
+var float[] CloseShortAmounts = array.new_float(0)
+
+// Net balance excluding floating PnL
+var float BalanceReal = na
+
+// Total cash in active Long positions
+var float LongPositionCash = 0
+// Total cash in active Short positions
+var float ShortPositionCash = 0
+
+// The initial Long position size (used for partial close)
+var float initialLongPositionSize = na
+// The initial Short position size (used for partial close)
+var float initialShortPositionSize = na
+
+// Total size (units) of active Long position
+var float LongPositionSize = 0
+// Total size (units) of active Short position
+var float ShortPositionSize = 0
+
+// Average entry price of active Long position
+var float AvgLongPrice = open
+// Average entry price of active Short position
+var float AvgShortPrice = open
+
+// Block Long entries after a CloseLong this bar
+var bool CloseLongExecutedThisBar = false
+// Block Short entries after a CloseShort this bar
+var bool CloseShortExecutedThisBar = false
+
+// Active Long stop-loss price
+var float LongStopLossLimitPrice = na
+// Active Short stop-loss price
+var float ShortStopLossLimitPrice = na
+
+// Long stop-loss triggered flag
+var bool LongStopLossActivated = false
+// Short stop-loss triggered flag
+var bool ShortStopLossActivated = false
+
+// Total commission paid from all trades
+var float Commission = 0
+// Total realized gains from all trades
+var float Gains = 0
+// Total realized losses (includes commissions)
+var float Losses = 0
+
+// Main accounting array (19 slots)
+var accountingArray = array.new_float(28, na)
+
+// Effective leverage for Long side
+var float CLeverageLong = 0.0
+// Effective leverage for Short side
+var float CLeverageShort = 0.0
+
+// Estimated liquidation price for Long side
+var float LiquidationPriceLong = na
+// Estimated liquidation price for Short side
+var float LiquidationPriceShort = na
+
+// Flag indicating Long-side liquidation occurred
+var bool liquidationOccurredLong = false
+// Timestamp when Long-side liquidation occurred
+var float liquidationTimeLong = na
+// Label object for Long liquidation event
+var label liquidationLabelLong = na
+
+// Flag indicating Short-side liquidation occurred
+var bool liquidationOccurredShort = false
+// Timestamp when Short-side liquidation occurred
+var float liquidationTimeShort = na
+// Label object for Short liquidation event
+var label liquidationLabelShort = na
+
+// Flag detecting new Long liquidation this candle
+var bool newLiquidationLong = false
+// Flag detecting new Short liquidation this candle
+var bool newLiquidationShort = false
+
+// Shared legacy combined liquidation flag (optional)
+var bool Liquidation = false
+// Shared legacy combined liquidation price (optional)
+var float LiquidationPrice = na
+// Shared legacy combined leverage (optional)
+var float CLeverage = na
+
+// Returns the proper size enum based on user input
+fTextSize(_SizeInput) =>
+    switch _SizeInput
+        'Auto'   => size.auto
+        'Tiny'   => size.tiny
+        'Small'  => size.small
+        'Normal' => size.normal
+        'Large'  => size.large
+        'Huge'   => size.huge
+        => size.normal  // Default fallback
+var int timeFirstLong  = na   // Timestamp of First Long execution (timenow)
+var int timeFirstShort = na   // Timestamp of First Short execution (timenow)
+
+// Cumulative trading volume across all entries (Long + Short), used to estimate monthly volume
+var float totalVolume = 0.0
+fR(_p) => math.round_to_mintick(_p)
+fSum(_Num) =>
+    _Num <= 0 ? 0.0 : (_Num * (_Num + 1)) / 2
+
+// Calculates equal cash allocation per remaining trades
+// Returns 0.0 if there are no trades remaining
+fCaPo_N(_N, _n) =>
+    rem = _N - nz(_n)
+    rem <= 0 ? 0.0 : 1.0 / rem
+
+// Calculates progressive allocation per position number
+// No longer depends on Spot vs Margin
+fCaPo_Nplus(_N, _n) =>
+    n = nz(_n) // Current trade number (normalized)
+    total = fSum(_N) // Total weighted sum
+    remaining = total - fSum(n) // Remaining weight to distribute
+    remaining <= 0 ? 0.0 : (n + 1.0) / remaining // Always progressive allocation
+pine_supertrend(factor, atrPeriod, src) =>
+    // Compute the Average True Range (ATR) over the given period
+    atr = ta.atr(atrPeriod)
+    // Calculate the upper band as the source plus ATR factor
+    _upperBand = src + factor * atr
+    // Calculate the lower band as the source minus ATR factor
+    _lowerBand = src - factor * atr
+    // Retrieve the previous lower band value
+    _prevLowerBand = nz(_lowerBand[1])
+    // Retrieve the previous upper band value
+    _prevUpperBand = nz(_upperBand[1])
+    // Stabilize the lower band: keep previous if price did not break down
+    _lowerBand := _lowerBand > _prevLowerBand or close[1] < _prevLowerBand ? _lowerBand : _prevLowerBand
+    // Stabilize the upper band: keep previous if price did not break up
+    _upperBand := _upperBand < _prevUpperBand or close[1] > _prevUpperBand ? _upperBand : _prevUpperBand
+    // Initialize the direction marker (-1 for down, 1 for up)
+    int _direction = na
+    // Initialize the SuperTrend line value
+    float _Supertrend = na
+    // Get the previous SuperTrend value
+    _prevSuperTrend = _Supertrend[1]
+    // Handle the first bar (no ATR yet) by defaulting direction to up
+    if na(atr[1])
+        _direction := 1
+    // Determine direction if previous SuperTrend was on the upper band
+    else if _prevSuperTrend == _prevUpperBand
+        // Use high instead of close to avoid repainting on upper breakout
+        _direction := high > _upperBand ? -1 : 1
+    // Determine direction if previous SuperTrend was on the lower band
+    else
+        // Use low instead of close to avoid repainting on lower breakdown
+        _direction := low < _lowerBand ? 1 : -1
+    // Assign the SuperTrend line based on current direction
+    _Supertrend := _direction == -1 ? _lowerBand : _upperBand
+    // Return both SuperTrend value and direction marker
+    [_Supertrend, _direction, _upperBand, _lowerBand]
+[Supertrend, Direction, upperBand, lowerBand] = pine_supertrend(superTrendMultiplier, superTrendLength, open)
+
+// SuperTrend + RSI classic: detect direction changes
+bool trendTurnedDown = Direction > 0 and Direction[1] < 0
+bool trendTurnedUp   = Direction < 0 and Direction[1] > 0
+
+// Final fused trend state (current and previous)
+bool isTrendDown     = Direction > 0
+bool isTrendDownPrev = Direction[1] > 0
+bool isTrendUp       = Direction < 0
+bool isTrendUpPrev   = Direction[1] < 0
+
+// Determine the dynamic color based on the current trend direction
+superTrendColor = Direction == 1 ? color.new(color.red, 25) : color.new(color.aqua, 25)
+
+// Plot the SuperTrend line only when in uptrend (green) or downtrend (red)
+plot(Direction < 0 ? Supertrend : na, "Up Direction", color=superTrendColor, style=plot.style_linebr, linewidth=1)
+plot(Direction > 0 ? Supertrend : na, "Down Direction", color=superTrendColor, style=plot.style_linebr, linewidth=1)
+
+// Create a hidden plot for the SuperTrend line to use in the fill shading
+hiddenLineSuperTrend = plot(Supertrend, display=display.none)
+// Create a hidden plot for the price (close) to use in the fill shading
+hiddenLinePrice = plot(close, display=display.none)
+
+// Apply a shaded fill between the SuperTrend line and the price
+fill(hiddenLineSuperTrend, hiddenLinePrice, color=color.new(superTrendColor, 90), title="SuperTrend Fill")
+fAlerts(_n, _msg) =>
+    if _n == 0
+        alert(_msg, alert.freq_once_per_bar)
+    if _n == 1
+        alert(_msg, alert.freq_once_per_bar)
+    if _n == 2
+        alert(_msg, alert.freq_once_per_bar)
+    if _n == 3
+        alert(_msg, alert.freq_once_per_bar)
+    if _n == 4
+        alert(_msg, alert.freq_once_per_bar)
+    if _n == 5
+        alert(_msg, alert.freq_once_per_bar)
+    if _n == 6
+        alert(_msg, alert.freq_once_per_bar)
+    if _n == 7
+        alert(_msg, alert.freq_once_per_bar)
+    if _n == 8
+        alert(_msg, alert.freq_once_per_bar)
+    if _n == 9
+        alert(_msg, alert.freq_once_per_bar)
+    if _n == 10
+        alert(_msg, alert.freq_once_per_bar)
+    if _n == 11
+        alert(_msg, alert.freq_once_per_bar)
+    if _n == 12
+        alert(_msg, alert.freq_once_per_bar)
+    if _n == 13
+        alert(_msg, alert.freq_once_per_bar)
+    if _n == 14
+        alert(_msg, alert.freq_once_per_bar)
+    if _n == 15
+        alert(_msg, alert.freq_once_per_bar)
+    if _n == 16
+        alert(_msg, alert.freq_once_per_bar)
+    if _n == 17
+        alert(_msg, alert.freq_once_per_bar)
+    if _n == 18
+        alert(_msg, alert.freq_once_per_bar)
+    if _n == 19
+        alert(_msg, alert.freq_once_per_bar)
+    if _n == 20
+        alert(_msg, alert.freq_once_per_bar)
+fAlertFirstLong(
+     float _pctUsed,         // % of balance to use for market entry
+     int _n                  // Alert slot index
+ ) =>
+    // Build perpetual futures symbol prefix
+    _Prefix = 'a=ACCOUNT e=exchangemix s=' + syminfo.basecurrency + syminfo.currency + '_UMCBL'
+    
+    // Descriptive comment block for tracking
+    _commentBlock = '0️⃣ FIRST LONG'
+
+    // === Open new Long market position with leverage
+    _msgMarket = _Prefix + ' b=long t=market q=' + str.tostring(_pctUsed, '#.#') + '% l=' + str.tostring(LeverageMultiplier)
+
+    // === Assemble final alert message (no cancel, no close)
+    string _fullMsg = _commentBlock
+    _fullMsg += ' | ' + _msgMarket
+
+    // Send the alert using the specified slot index
+    fAlerts(_n, _fullMsg)
+fAlertGridLong(
+     float _NextLongPrice,   // Next grid Long limit price
+     float _pctNext,         // % of balance to allocate
+     float _TPPrice,         // Take Profit price
+     float _pctTP,           // % of position to close at TP
+     int _n                  // Alert slot index
+ ) =>
+    // Build the execution prefix
+    _Prefix = 'a=ACCOUNT e=exchangemix s=' + syminfo.basecurrency + syminfo.currency + '_UMCBL'
+    // Descriptive comment block for log tracing
+    _commentBlock = '🟦 GRID LONG'
+
+    // Cancel only if Long-related orders exist
+    _hasOrders = array.size(LongLimitPrices) > 0 or array.size(CloseLongLimitPrices) > 0
+    _msgCancel = _hasOrders ? _Prefix + ' c=order' : ""
+
+    // Only send Take Profit if there's an active Long position
+    _msgClose = LongPositionSize > 0
+         ? _Prefix + ' b=long c=position q=' + str.tostring(_pctTP, '#.#') + '% fp=' + str.tostring(_TPPrice)
+         : ""
+
+    // Only send next Limit Long if under MaxEntries
+    _msgNext = nLongs < MaxEntries and not na(_NextLongPrice)
+         ? _Prefix + ' b=long q=' + str.tostring(_pctNext, '#.#') + '% fp=' + str.tostring(_NextLongPrice) + ' l=' + str.tostring(LeverageMultiplier)
+         : ""
+
+    // Assemble the message
+    string _fullMsg = _commentBlock
+    if _msgCancel != ""
+        _fullMsg += ' | ' + _msgCancel
+    if _msgClose != ""
+        _fullMsg += ' | ' + _msgClose
+    if _msgNext != ""
+        _fullMsg += ' | ' + _msgNext
+
+    // Send alert to the corresponding slot
+    fAlerts(_n, _fullMsg)
+fAlertFirstShort(
+     float _pctUsed,         // % of balance to use for market entry
+     int _n                  // Alert slot index
+ ) =>
+    // Build perpetual futures symbol prefix
+    _Prefix = 'a=ACCOUNT e=exchangemix s=' + syminfo.basecurrency + syminfo.currency + '_UMCBL'
+    
+    // Descriptive comment block for tracking
+    _commentBlock = '🅾️ FIRST SHORT'
+
+    // === Open new Short market position with leverage
+    _msgMarket = _Prefix + ' b=short t=market q=' + str.tostring(_pctUsed, '#.#') + '% l=' + str.tostring(LeverageMultiplier)
+
+    // === Assemble final alert message (no cancel, no close)
+    string _fullMsg = _commentBlock
+    _fullMsg += ' | ' + _msgMarket
+
+    // Send the alert using the specified slot index
+    fAlerts(_n, _fullMsg)
+fAlertGridShort(
+     float _NextShortPrice,   // Next grid Short limit price
+     float _pctNext,          // % of balance to allocate
+     float _TPPrice,          // Take Profit price
+     float _pctTP,            // % of position to close at TP
+     int _n                   // Alert slot index
+ ) =>
+    // Build the execution prefix
+    _Prefix = 'a=ACCOUNT e=exchangemix s=' + syminfo.basecurrency + syminfo.currency + '_UMCBL'
+    // Descriptive comment block for log tracing
+    _commentBlock = '🟥 GRID SHORT'
+
+    // Cancel only if Short-related orders exist
+    _hasOrders = array.size(ShortLimitPrices) > 0 or array.size(CloseShortLimitPrices) > 0
+    _msgCancel = _hasOrders ? _Prefix + ' c=order' : ""
+
+    // Only send Take Profit if there's an active Short position
+    _msgClose = ShortPositionSize > 0
+         ? _Prefix + ' b=short c=position q=' + str.tostring(_pctTP, '#.#') + '% fp=' + str.tostring(_TPPrice)
+         : ""
+
+    // Only send next Limit Short if under MaxEntries
+    _msgNext = nShorts < MaxEntries and not na(_NextShortPrice)
+         ? _Prefix + ' b=short q=' + str.tostring(_pctNext, '#.#') + '% fp=' + str.tostring(_NextShortPrice) + ' l=' + str.tostring(LeverageMultiplier)
+         : ""
+
+    // Assemble the message
+    string _fullMsg = _commentBlock
+    if _msgCancel != ""
+        _fullMsg += ' | ' + _msgCancel
+    if _msgClose != ""
+        _fullMsg += ' | ' + _msgClose
+    if _msgNext != ""
+        _fullMsg += ' | ' + _msgNext
+
+    // Send alert to the corresponding slot
+    fAlerts(_n, _fullMsg)
+fAlertCloseLongEntry(
+     float _nextLong,     // Next Long limit price
+     float _pctNext,      // % of balance to use for next entry
+     float _nextClose,    // Take Profit price (CloseLong)
+     float _pctTP,        // % of position to close at this TP
+     int _n               // Alert slot index
+ ) =>
+    // Construct the symbol prefix
+    _Prefix = 'a=ACCOUNT e=exchangemix s=' + syminfo.basecurrency + syminfo.currency + '_UMCBL'
+
+    // Descriptive comment for tracking in alert logs
+    _commentBlock = '🟧 CLOSE LONG'
+
+    // Always cancel any existing orders on this side
+    _msgCancel = _Prefix + ' c=order'
+
+    // Only send Close order if we haven’t reached the last CloseLong level
+    _msgClose = nCloseLongs < MaxCloseLevels and LongPositionSize > 0
+         ? _Prefix + ' b=long c=position q=' + str.tostring(_pctTP, '#.#') + '% fp=' + str.tostring(_nextClose)
+         : ""
+
+    // Only send new Limit Long order if we're not at the final Close level
+    _msgNext = nCloseLongs < MaxCloseLevels
+         ? _Prefix + ' b=long q=' + str.tostring(_pctNext, '#.#') + '% fp=' + str.tostring(_nextLong) + ' l=' + str.tostring(LeverageMultiplier)
+         : ""
+
+    // Assemble the alert message dynamically, including only valid parts
+    string _fullMsg = _commentBlock + ' | ' + _msgCancel
+    if _msgClose != ""
+        _fullMsg += ' | ' + _msgClose
+    if _msgNext != ""
+        _fullMsg += ' | ' + _msgNext
+
+    // Dispatch the alert using the specified slot index
+    fAlerts(_n, _fullMsg)
+fAlertCloseShortEntry(
+     float _nextShort,    // Next Short limit price
+     float _pctNext,      // % of balance to use for next entry
+     float _nextClose,    // Take Profit price (CloseShort)
+     float _pctTP,        // % of position to close at this TP
+     int _n               // Alert slot index
+ ) =>
+    // Construct the symbol prefix
+    _Prefix = 'a=ACCOUNT e=exchangemix s=' + syminfo.basecurrency + syminfo.currency + '_UMCBL'
+
+    // Descriptive comment for tracking in alert logs
+    _commentBlock = '🟩 CLOSE SHORT'
+
+    // Always cancel any existing orders on this side
+    _msgCancel = _Prefix + ' c=order'
+
+    // Only send Close order if we haven’t reached the last CloseShort level
+    _msgClose = nCloseShorts < MaxCloseLevels and ShortPositionSize > 0
+         ? _Prefix + ' b=short c=position q=' + str.tostring(_pctTP, '#.#') + '% fp=' + str.tostring(_nextClose)
+         : ""
+
+    // Only send new Limit Short order if we're not at the final Close level
+    _msgNext = nCloseShorts < MaxCloseLevels
+         ? _Prefix + ' b=short q=' + str.tostring(_pctNext, '#.#') + '% fp=' + str.tostring(_nextShort) + ' l=' + str.tostring(LeverageMultiplier)
+         : ""
+
+    // Assemble the alert message dynamically, including only valid parts
+    string _fullMsg = _commentBlock + ' | ' + _msgCancel
+    if _msgClose != ""
+        _fullMsg += ' | ' + _msgClose
+    if _msgNext != ""
+        _fullMsg += ' | ' + _msgNext
+
+    // Dispatch the alert using the specified slot index
+    fAlerts(_n, _fullMsg)
+fAlertLongExit(float _n) =>
+    // Construct the trading symbol for perpetual futures
+    _Prefix = 'a=ACCOUNT e=exchangemix s=' + syminfo.basecurrency + syminfo.currency + '_UMCBL'
+
+    // Build comment and command for canceling Long limit orders
+    _comment = '❌ CANCEL LONG'
+    _msg = _Prefix + ' c=order b=long'
+    _fullMsg = _comment + ' | ' + _msg
+    fAlerts(_n, _fullMsg)
+
+    // Send close LONG position alert 2 seconds before bar close (real-time only)
+    if not na(time_close) and not na(timenow)
+        timeRemaining = time_close - timenow
+        if timeRemaining <= 3000
+            _commentClose = '🔚 CLOSE LONG POSITION'
+            _msgClose = _Prefix + ' c=position b=long t=market'
+            _fullMsgClose = _commentClose + ' | ' + _msgClose
+            fAlerts(_n + 1, _fullMsgClose)
+fAlertShortExit(float _n) =>
+    // Construct the trading symbol for perpetual futures
+    _Prefix = 'a=ACCOUNT e=exchangemix s=' + syminfo.basecurrency + syminfo.currency + '_UMCBL'
+
+    // Build comment and command for canceling Short limit orders
+    _comment = '✖️ CANCEL SHORT'
+    _msg = _Prefix + ' c=order b=short'
+    _fullMsg = _comment + ' | ' + _msg
+    fAlerts(_n, _fullMsg)
+
+    // Send close SHORT position alert 2 seconds before bar close (real-time only)
+    if not na(time_close) and not na(timenow)
+        timeRemaining = time_close - timenow
+        if timeRemaining <= 3000
+            _commentClose = '🔚 CLOSE SHORT POSITION'
+            _msgClose = _Prefix + ' c=position b=short t=market'
+            _fullMsgClose = _commentClose + ' | ' + _msgClose
+            fAlerts(_n + 1, _fullMsgClose)
+fAlertStopLossLong(float _n) =>
+    // Build the symbol prefix
+    _Prefix = 'a=ACCOUNT e=exchangemix s=' + syminfo.basecurrency + syminfo.currency + '_UMCBL'
+    // Descriptive comment for tracking
+    _comment = '🛑 STOP LOSS LONG'
+
+    // Mensaje de cierre forzado de Long
+    string _msgClose = _Prefix + ' b=long c=position t=market'
+
+    // Construir mensaje final
+    string _fullMsg = _comment + ' | ' + _msgClose
+
+    // Enviar alerta
+    fAlerts(_n, _fullMsg)
+fAlertStopLossShort(float _n) =>
+    // Build the symbol prefix
+    _Prefix = 'a=ACCOUNT e=exchangemix s=' + syminfo.basecurrency + syminfo.currency + '_UMCBL'
+    // Descriptive comment for tracking
+    _comment = '🛑 STOP LOSS SHORT'
+
+    // Mensaje de cierre forzado de Short
+    string _msgClose = _Prefix + ' b=short c=position t=market'
+
+    // Construir mensaje final
+    string _fullMsg = _comment + ' | ' + _msgClose
+
+    // Enviar alerta
+    fAlerts(_n, _fullMsg)
+fRequiredDepositForInitialCapital(_Capital) =>
+    // Width (stop distance %) as decimal
+    _stopPct = Width / 100
+    // Risk as decimal
+    _riskPct = RiskPctPerTrade / 100    
+    // Calculate raw size per entry
+    _totalCapital = (_Capital * _riskPct) / _stopPct
+    // Adjust for leverage
+    _requiredDeposit = _totalCapital / LeverageMultiplier
+    // Add buffer (10%) y limitar al 100% del capital
+    math.min(_requiredDeposit * 1.10, _Capital)
+
+// Returns maintenance margin rate (%) based on total position value
+fGetMMR(_positionValue) =>
+    _positionValue <= 150000 ? 0.004 :
+     _positionValue <= 900000 ? 0.005 :
+     _positionValue <= 3000000 ? 0.01 :
+     _positionValue <= 6000000 ? 0.015 :
+     0.02  // For positions over 6M
+
+// Updates internal capital tracking values
+fFullAccountingUpdate(_BalanceReal) =>    
+    int lookbackMax = 5000
+    bool isLongActive = LongPositionSize > 0
+    bool isShortActive = ShortPositionSize > 0
+    float passiveReturnLong = (not na(FirstLongPrice) and FirstLongPrice > 0)
+         ? ((close - FirstLongPrice) / FirstLongPrice) * 100
+         : 0.0    
+    float passiveReturnShort = (not na(FirstShortPrice) and FirstShortPrice > 0)
+         ? ((FirstShortPrice - close) / FirstShortPrice) * 100
+         : 0.0    
+    float passiveReturn = 0.0
+    // Select passive return based on TradeMode
+    if TradeMode == "Long"
+        passiveReturn := passiveReturnLong
+    else if TradeMode == "Short"
+        passiveReturn := passiveReturnShort
+    else if TradeMode == "Dual-Side"
+        passiveReturn := math.max(passiveReturnLong, passiveReturnShort)  // Take the best performing
+    array.set(accountingArray, 0, passiveReturn)  // Raw %
+    array.set(accountingArray, 1, passiveReturn)  // Raw %
+    prevMaxEquity = array.get(accountingArray, 2)
+    prevMaxEquity := na(prevMaxEquity) ? InitialCapital : prevMaxEquity
+    array.set(accountingArray, 2, math.max(prevMaxEquity, _BalanceReal))
+    passiveEquity = InitialCapital * (1 + passiveReturn / 100)
+    prevMaxPassive = array.get(accountingArray, 3)
+    prevMaxPassive := na(prevMaxPassive) ? passiveEquity : prevMaxPassive
+    array.set(accountingArray, 3, math.max(prevMaxPassive, passiveEquity))
+    maxEquity = array.get(accountingArray, 2)
+    drawdown = maxEquity > 0 ? math.abs(math.min(0.0, _BalanceReal / maxEquity - 1)) * 100 : 0.0
+    array.set(accountingArray, 4, drawdown)         // Current drawdown %
+    array.set(accountingArray, 19, drawdown)        // Max Drawdown (for panel display)
+    barStartLong = ta.valuewhen(not na(FirstLongPrice), bar_index, 0)    
+    // Get the bar index where the first Short was executed
+    barStartShort = ta.valuewhen(not na(FirstShortPrice), bar_index, 0)
+    // Calculate how many bars have passed since the first Long (limited by max lookback)
+    lengthBarsLong = not na(barStartLong) and bar_index >= barStartLong
+         ? math.min(bar_index - barStartLong + 1, lookbackMax)
+         : 1    
+    // Calculate how many bars have passed since the first Short (limited by max lookback)
+    lengthBarsShort = not na(barStartShort) and bar_index >= barStartShort
+         ? math.min(bar_index - barStartShort + 1, lookbackMax)
+         : 1
+    // Get the highest price reached since the Long entry
+    _maxSinceStartLong = ta.highest(close, lengthBarsLong)    
+    // Get the highest price reached since the Short entry
+    // (used to calculate how far price moved against the Short)
+    _maxSinceStartShort = ta.highest(close, lengthBarsShort)
+    // Calculate drawdown for the Long position (in %)
+    // Difference between highest price after entry and entry price
+    _holdDrawdownLong = (not na(FirstLongPrice) and not na(_maxSinceStartLong))
+         ? math.abs((FirstLongPrice - _maxSinceStartLong) / FirstLongPrice * 100)
+         : 0.0    
+    // Calculate drawdown for the Short position (in %)
+    // How much price went up after entering short
+    _holdDrawdownShort = (not na(FirstShortPrice) and not na(_maxSinceStartShort))
+         ? math.abs((_maxSinceStartShort - FirstShortPrice) / FirstShortPrice * 100)
+         : 0.0
+    // Choose which drawdown to use based on the currently active side
+    _newHoldDD = isLongActive ? _holdDrawdownLong : (isShortActive ? _holdDrawdownShort : 0.0)
+    // Save the result into slot 5 of the accounting array (passive drawdown %)
+    array.set(accountingArray, 5, _newHoldDD)
+
+    // ==========================================================
+    // NET PROFIT CALCULATION – REALIZED PROFITS (AFTER COMMISSIONS)
+    // ==========================================================
+    netProfit = _BalanceReal - InitialCapital
+    array.set(accountingArray, 6, netProfit)                        // Net profit $
+    array.set(accountingArray, 7, InitialCapital > 0 ? netProfit / InitialCapital * 100 : 0.0)  // Net profit %
+    float unrealizedPnL = (
+         isLongActive and not na(AvgLongPrice) and AvgLongPrice > 0
+     )
+         ? (close - AvgLongPrice) * LongPositionSize
+         : (
+             isShortActive and not na(AvgShortPrice) and AvgShortPrice > 0
+             ? (AvgShortPrice - close) * ShortPositionSize
+             : 0.0
+         )
+    // Store the unrealized PnL (absolute $ value) into slot 8
+    array.set(accountingArray, 8, unrealizedPnL)
+    // Store the unrealized PnL as a % of BalanceReal into slot 9
+    array.set(
+         accountingArray,
+         9,
+         _BalanceReal > 0 ? unrealizedPnL / _BalanceReal * 100 : 0.0
+     )
+
+    // ==========================================================
+    // TOTAL PNL CALCULATION – COMBINED REALIZED + FLOATING
+    // ==========================================================
+    totalPnL = netProfit + unrealizedPnL
+    array.set(accountingArray, 10, totalPnL)                      // Total PnL $
+    array.set(accountingArray, 11, InitialCapital > 0 ? totalPnL / InitialCapital * 100 : 0.0)  // Total PnL %
+
+    // ==========================================================
+    // FINAL EQUITY INCLUDING FLOATING PROFITS
+    // ==========================================================
+    array.set(accountingArray, 12, _BalanceReal + unrealizedPnL)
+
+    // ==========================================================
+    // MARGIN USED (IF LEVERAGED ACCOUNT)
+    // ==========================================================
+    // Get position value depending on side
+    positionValue = isLongActive
+         ? LongPositionSize * AvgLongPrice
+         : isShortActive ? ShortPositionSize * AvgShortPrice
+         : 0.0
+    // Lookup maintenance margin rate and calculate margin
+    maintenanceRate = fGetMMR(positionValue)
+    maintenanceMargin = positionValue * maintenanceRate
+    // Margin used including maintenance
+    float marginUsed = 0.0
+    if LeverageMultiplier > 1
+        marginUsed := isLongActive
+             ? LongPositionSize * AvgLongPrice / LeverageMultiplier
+             : isShortActive
+                 ? ShortPositionSize * AvgShortPrice / LeverageMultiplier
+                 : 0.0
+        // Add maintenance margin only in leveraged mode
+        marginUsed += maintenanceMargin
+    // Store in accounting array
+    array.set(accountingArray, 13, marginUsed)                                  // Used margin (0 if spot)
+    array.set(accountingArray, 14, math.max(0, _BalanceReal - marginUsed))      // Available cash
+
+    // ==========================================================
+    // PROFIT FACTOR (GAINS VS LOSSES)
+    // ==========================================================
+    // Profit Factor = Total Gains ÷ Total Losses (excluding fees already counted separately)
+    realLosses = Losses - Commission
+    profitFactor = (realLosses > 0 and Gains > 0) ? Gains / realLosses : na
+    array.set(accountingArray, 15, profitFactor)
+    
+    // ==========================================================
+    // WIN RATE (% OF WINNING TRADES)
+    // ==========================================================
+    // Win Rate = Winning Trades ÷ Total Trades (wins + losses)
+    winRate = (nWins + nLosses) > 0 ? (nWins / (nWins + nLosses)) * 100 : na
+    array.set(accountingArray, 16, winRate)
+    _strategyReturn = array.get(accountingArray, 7)
+    // Get the passive buy & hold return (%) (slot 1)
+    _holdReturn = array.get(accountingArray, 1)
+    // Get the drawdown from the strategy (slot 4)
+    _strategyDD = array.get(accountingArray, 4)
+    // Get the drawdown from the buy & hold approach (slot 5)
+    _holdDD = array.get(accountingArray, 5)
+    // Calculate Hold Efficiency:    
+    float holdEfficiency = (
+         not na(_strategyReturn) and _strategyDD > 0 and
+         not na(_holdReturn) and _holdDD > 0
+     )
+         ? (_holdReturn > 0
+             ? (_strategyReturn / _strategyDD) / (_holdReturn / _holdDD)
+             : na)
+         : na
+    // Store the hold efficiency ratio in slot 17
+    array.set(accountingArray, 17, holdEfficiency)
+
+    // ==========================================================
+    // ELAPSED TIME SINCE FIRST ENTRY (IN MILLISECONDS)
+    // ==========================================================
+    // Estimate elapsed time from first Long or Short entry
+    float elapsedTime = not na(FirstLongTime)
+         ? timenow - FirstLongTime
+         : not na(FirstShortTime)
+             ? timenow - FirstShortTime
+             : 0.0
+    // Only update if new value is greater than current
+    oldElapsed = array.get(accountingArray, 18)
+    array.set(accountingArray, 18, elapsedTime > oldElapsed ? elapsedTime : oldElapsed)
+
+    // ==========================================================
+    // COMMISSION TOTAL (ALL FEES PAID)
+    // ==========================================================
+    array.set(accountingArray, 20, Commission)
+
+    // ==========================================================
+    // ESTIMATED MINIMUM CAPITAL – To Support Full Grid Execution
+    // ==========================================================
+    _estimatedMinCapital = fRequiredDepositForInitialCapital(BalanceReal)
+    array.set(accountingArray, 21, _estimatedMinCapital)
+
+    // ==========================================================
+    // ROI ON CURRENT POSITION – Real-time Floating ROI
+    // ----------------------------------------------------------
+    // ROI is calculated differently depending on leverage:
+    // - In leveraged mode (>1x), use margin used (slot 13)
+    // - In spot mode (1x), use real invested capital (LongPositionCash / ShortPositionCash)
+    // ==========================================================
+    // Get margin used (slot 13) and unrealized profit (slot 8)
+    marginUsedForROI = array.get(accountingArray, 13)
+    // Calculate ROI depending on leverage
+    float roiExchangeStyle = na
+    if LeverageMultiplier > 1
+        roiExchangeStyle := marginUsedForROI > 0 ? unrealizedPnL / marginUsedForROI * 100 : na
+    else
+        investedCapital = LongPositionSize > 0 ? LongPositionCash : ShortPositionSize > 0 ? ShortPositionCash : na
+        roiExchangeStyle := investedCapital > 0 ? unrealizedPnL / investedCapital * 100 : na
+    // Store it in slot 22
+    array.set(accountingArray, 22, roiExchangeStyle)
+
+    // ==========================================================
+    // EXPECTANCY (% RISK) – Average Return Per Trade Relative to Risk
+    // ----------------------------------------------------------
+    // Calculates the average profit or loss per trade as a percentage
+    // of the capital risked per trade (normalized expectancy).
+    // Expressed in %R units. Example: 85% = +0.85R expectancy
+    // ==========================================================
+    // Total number of closed trades (wins + losses)
+    float totalTrades = nWins + nLosses
+    // Win rate in decimal (e.g. 0.65 = 65% win rate)
+    float winRateRaw = totalTrades > 0 ? nWins / totalTrades : na
+    // Loss rate in decimal (complement of win rate)
+    float lossRateRaw = totalTrades > 0 ? nLosses / totalTrades : na
+    // Average gain per winning trade
+    float avgWin = nWins > 0 ? Gains / nWins : 0
+    // Average loss per losing trade
+    float avgLoss = nLosses > 0 ? Losses / nLosses : 0
+    // Raw expectancy (in currency)
+    float expectancyRaw = (totalTrades > 0 and nLosses > 0 and nWins > 0)
+         ? (winRateRaw * avgWin) - (lossRateRaw * avgLoss)
+         : na
+    // Risk per trade in currency units (e.g. 1% of initial capital)
+    float avgRiskPerTrade = InitialCapital * (RiskPctPerTrade / 100)
+    // Expectancy as percentage of risk per trade
+    float expectancyPctRisk = avgRiskPerTrade > 0 and not na(expectancyRaw)
+         ? (expectancyRaw / avgRiskPerTrade) * 100
+         : na
+    // Store expectancy %R in accounting slot 23 for panel display
+    array.set(accountingArray, 23, expectancyPctRisk)
+    // A value > 0 means a positive edge per trade.
+    // Example: 85.00% means average return of +0.85R per trade.
+
+    // ==========================================================
+    // PAYOFF RATIO – Avg Win vs Avg Loss Per Trade
+    // ----------------------------------------------------------
+    // Measures the average reward-to-risk per trade.
+    // Shows how much you gain on winners compared to what you lose on losers.
+    // High payoff can compensate for low win rate.
+    // ==========================================================    
+    // Average gain per winning trade
+    float avgWinPayoff = nWins > 0 ? Gains / nWins : na
+    // Average loss per losing trade
+    float avgLossPayoff = nLosses > 0 ? Losses / nLosses : na
+    // Payoff ratio: AvgWin / AvgLoss
+    float payoffRatio = (not na(avgWinPayoff) and not na(avgLossPayoff) and avgLossPayoff > 0)
+         ? avgWinPayoff / avgLossPayoff
+         : na
+    // Store in accounting array slot 24
+    array.set(accountingArray, 24, payoffRatio)
+    elapsedMonths = elapsedTime / 1000 / 60 / 60 / 24 / 30.44
+    // Compute average monthly volume
+    volumeMonthly = elapsedMonths > 0 ? totalVolume / elapsedMonths : na
+    // Store it in accounting array slot 25 (custom extension)
+    array.set(accountingArray, 25, volumeMonthly)
+    floatingPctPosition =
+         LongPositionSize > 0 and not na(AvgLongPrice) ?
+             ((close - AvgLongPrice) / AvgLongPrice) * 100 :
+         ShortPositionSize > 0 and not na(AvgShortPrice) ?
+             ((AvgShortPrice - close) / AvgShortPrice) * 100 :
+         na
+    // Store it in a new slot: 26
+    array.set(accountingArray, 26, floatingPctPosition)
+    netProfitNoFees = Gains - Losses + Commission
+    netProfitPctNoFees = InitialCapital > 0 ? (netProfitNoFees / InitialCapital) * 100 : 0.0
+    // Store it in a new slot: 27
+    array.set(accountingArray, 27, netProfitPctNoFees)
+BalanceReal := array.get(accountingArray, 12) - array.get(accountingArray, 8)
+
+// Calculate effective leverage for Long side (position size over balance)
+CLeverageLong := (LongPositionSize > 0 and BalanceReal > 0)
+     ? (LongPositionSize * AvgLongPrice) / BalanceReal
+     : 0.0
+
+// Calculate effective leverage for Short side (position size over balance)
+CLeverageShort := (ShortPositionSize > 0 and BalanceReal > 0)
+     ? (ShortPositionSize * AvgShortPrice) / BalanceReal
+     : 0.0
+
+// Estimate Long-side liquidation price under leverage conditions
+LiquidationPriceLong := (LongPositionSize > 0 and LeverageMultiplier > 1 and CLeverageLong != 0)
+     ? AvgLongPrice * (1 - 1 / CLeverageLong) * (1 - 1 / LeverageMultiplier)
+     : na
+
+// Estimate Short-side liquidation price under leverage conditions
+LiquidationPriceShort := (ShortPositionSize > 0 and LeverageMultiplier > 1 and CLeverageShort != 0)
+     ? AvgShortPrice * (1 + 1 / CLeverageShort) * (1 + 1 / LeverageMultiplier)
+     : na
+
+// Check if Long-side liquidation is triggered on this bar
+newLiquidationLong := (LongPositionSize > 0 and LeverageMultiplier > 1 and not na(LiquidationPriceLong) and low <= LiquidationPriceLong and not liquidationOccurredLong)
+if newLiquidationLong
+    // Mark Long liquidation event as occurred
+    liquidationOccurredLong := true
+    // Record the time of liquidation
+    liquidationTimeLong := time
+    // Create a visual label on the chart
+    liquidationLabelLong := label.new(
+         bar_index + 1,
+         LiquidationPriceLong,
+         '💥 Long Liquidated\n' + str.tostring(LiquidationPriceLong, '#.##'),
+         style = label.style_label_left,
+         color = color.new(color.purple, 45),
+         textcolor = color.new(color.white, 10),
+         size = size.normal
+     )
+
+// Check if Short-side liquidation is triggered on this bar
+newLiquidationShort := (ShortPositionSize > 0 and LeverageMultiplier > 1 and not na(LiquidationPriceShort) and high >= LiquidationPriceShort and not liquidationOccurredShort)
+if newLiquidationShort
+    // Mark Short liquidation event as occurred
+    liquidationOccurredShort := true
+    // Record the time of liquidation
+    liquidationTimeShort := time
+    // Create a visual label on the chart
+    liquidationLabelShort := label.new(
+         bar_index + 1,
+         LiquidationPriceShort,
+         '💥 Short Liquidated\n' + str.tostring(LiquidationPriceShort, '#.##'),
+         style = label.style_label_left,
+         color = color.new(color.purple, 45),
+         textcolor = color.new(color.white, 10),
+         size = size.normal
+     )
+LiquidationPrice := LongPositionSize > 0    // If there is an active Long position
+     ? LiquidationPriceLong                 // Use the Long-side liquidation price
+     : ShortPositionSize > 0                // Otherwise, if there's a Short position
+         ? LiquidationPriceShort            // Use the Short-side liquidation price
+         : na                               // If no position is active, set to `na`
+
+CLeverage := LongPositionSize > 0          // If Long is active
+     ? CLeverageLong                       // Use Long leverage
+     : ShortPositionSize > 0               // Else if Short is active
+         ? CLeverageShort                  // Use Short leverage
+         : na                              // Otherwise, set to `na`
+if liquidationOccurredLong
+    LongPositionSize := 0
+    LongPositionCash := 0
+    nLongs := 0
+    nCloseLongs := 0
+    LongStopLossActivated := false
+    initialLongPositionSize := na
+    AvgLongPrice := na
+    array.clear(LongLimitPrices)
+    array.clear(CloseLongLimitPrices)
+    array.clear(LongPrices)
+    array.clear(CloseLongPrices)
+    LongStopLossLimitPrice := na
+    CLeverageLong := 0.0
+    LiquidationPriceLong := na
+    fFullAccountingUpdate(BalanceReal)  // Update financials after Long reset
+
+// Reset all Short-side variables and arrays after liquidation
+if liquidationOccurredShort
+    ShortPositionSize := 0
+    ShortPositionCash := 0
+    nShorts := 0
+    nCloseShorts := 0
+    ShortStopLossActivated := false
+    initialShortPositionSize := na
+    AvgShortPrice := na
+    array.clear(ShortLimitPrices)
+    array.clear(CloseShortLimitPrices)
+    array.clear(ShortPrices)
+    array.clear(CloseShortPrices)
+    ShortStopLossLimitPrice := na
+    CLeverageShort := 0.0
+    LiquidationPriceShort := na
+    fFullAccountingUpdate(BalanceReal)  // Update financials after Short reset
+
+// PLOT LONG LIQUIDATION LINE – Only if within 5% of current price
+plot(
+     (LeverageMultiplier > 1 and LongPositionSize > 0 and not na(LiquidationPriceLong) and math.abs(LiquidationPriceLong - close) / close <= 0.05)
+         ? LiquidationPriceLong
+         : na,
+     title = "Liquidation Price Long",
+     color = liquidationOccurredLong ? color.new(color.red, 25) : color.new(color.green, 25),
+     style = plot.style_cross,
+     linewidth = 2
+ )
+
+// PLOT SHORT LIQUIDATION LINE – Only if within 5% of current price
+plot(
+     (LeverageMultiplier > 1 and ShortPositionSize > 0 and not na(LiquidationPriceShort) and math.abs(LiquidationPriceShort - close) / close <= 0.05)
+         ? LiquidationPriceShort
+         : na,
+     title = "Liquidation Price Short",
+     color = liquidationOccurredShort ? color.new(color.red, 25) : color.new(color.green, 25),
+     style = plot.style_cross,
+     linewidth = 2
+ )
+fCalculateLongQuantity(_NLongs, _CashAvailable) =>
+    // Ensure we have at least one allowed entry to avoid division by zero
+    _N = math.max(_NLongs, 1)
+
+    // Initialize variable to track simulated margin for pending Long orders
+    float marginReserved = 0.0
+    // Loop through all currently active Long limit prices
+    if array.size(LongLimitPrices) > 0
+        for i = 0 to array.size(LongLimitPrices) - 1
+            _price = array.get(LongLimitPrices, i)
+            // Only process valid prices
+            if not na(_price)
+                // Calculate simulated risk allocation for this order
+                _simRisk = (_CashAvailable * (RiskPctPerTrade / 100)) / _N
+                // Convert risk into base quantity using stop-loss width
+                _simQty = _simRisk / math.max(Width / 100, 0.0001)
+                // Estimate margin required with leverage
+                _simMargin = _simQty / LeverageMultiplier
+                // Add to total reserved margin
+                marginReserved += _simMargin
+
+    // Subtract reserved margin from available cash
+    float effectiveCash = math.max(0.0, _CashAvailable - marginReserved)    
+    // Compute total capital to risk based on effective cash
+    float totalRisk = effectiveCash * (RiskPctPerTrade / 100)    
+    // StopDistance logic
+    float stopDistance = (Width / 100)
+    // Allocate risk per planned entry
+    float riskPortion = totalRisk / _N
+    // Calculate raw position size without leverage
+    float baseQty = riskPortion / stopDistance
+    // Compute max allowable position based on leverage
+    float maxQty = effectiveCash * LeverageMultiplier
+    // Return the lower of calculated size or max allowed
+    math.min(baseQty, maxQty)
+fCalculateShortQuantity(_NShorts, _CashAvailable) =>
+    // Ensure we have at least one allowed entry to avoid division by zero
+    _N = math.max(_NShorts, 1)
+
+    // Initialize variable to track simulated margin for pending Short orders
+    float marginReserved = 0.0
+    // Loop through all currently active Short limit prices
+    if array.size(ShortLimitPrices) > 0
+        for i = 0 to array.size(ShortLimitPrices) - 1
+            _price = array.get(ShortLimitPrices, i)
+            // Only process valid prices
+            if not na(_price)
+                // Calculate simulated risk allocation for this order
+                _simRisk = (_CashAvailable * (RiskPctPerTrade / 100)) / _N
+                // Convert risk into base quantity using stop-loss width
+                _simQty = _simRisk / math.max(Width / 100, 0.0001)
+                // Estimate margin required with leverage
+                _simMargin = _simQty / LeverageMultiplier
+                // Add to total reserved margin
+                marginReserved += _simMargin
+
+    // Subtract reserved margin from available cash
+    float effectiveCash = math.max(0.0, _CashAvailable - marginReserved)
+    // Compute total capital to risk based on effective cash
+    float totalRisk = effectiveCash * (RiskPctPerTrade / 100)
+    // StopDistance logic
+    float stopDistanceShort = (Width / 100)
+    // Allocate risk per planned entry
+    float riskPortion = totalRisk / _N
+    // Calculate raw position size without leverage
+    float baseQty = riskPortion / stopDistanceShort
+    // Compute max allowable position based on leverage
+    float maxQty = effectiveCash * LeverageMultiplier
+    // Return the lower of calculated size or max allowed
+    math.min(baseQty, maxQty)
+fGridEntrySizeAndPercent(_side, _maxEntries) =>
+    // Calculate available capital for new grid orders (excluding used margin)
+    float _qty = na
+    float _pct = na
+    float _cashAvailable = BalanceReal - array.get(accountingArray, 13)
+
+    // Calculate the position size based on grid side (long/short)
+    _qty := _side == "long"
+         ? fCalculateLongQuantity(_maxEntries, _cashAvailable)
+         : fCalculateShortQuantity(_maxEntries, _cashAvailable)
+
+    // Calculate % of total (leveraged) balance this entry would consume
+    _pct := (_qty > 0 and BalanceReal > 0)
+         ? (_qty / (BalanceReal * LeverageMultiplier)) * 100
+         : 0
+
+    // Always clamp percent to 100% for safety (exchange constraints)
+    [_qty, math.min(_pct, 100)]
+fGridCloseSizeAndPercent(_side, _closeIndex) =>
+    // Determine the current size of the position (Long or Short)
+    float _posSize = _side == "short" ? ShortPositionSize : LongPositionSize
+    int   _totalCloses = MaxCloseLevels
+    string _closeMode  = CloseType
+
+    // If this is the final close, close everything that's left
+    float _closeQty = (_closeIndex == _totalCloses - 1)
+         ? _posSize
+         : (_closeMode == "Equal"
+             ? fCaPo_N(_totalCloses, _closeIndex) * _posSize
+             : fCaPo_Nplus(_totalCloses, _closeIndex) * _posSize)
+
+    // What percent of the *current* open position does this close represent?
+    float _closePct = (_posSize > 0 and _closeQty > 0) ? (_closeQty / _posSize) * 100 : 0
+
+    // Clamp percentage for display and risk safety
+    [_closeQty, math.min(_closePct, 100)]
+if array.size(accountingArray) == 0
+    accountingArray := array.new_float(19, na)
+
+// Ensure all accounting slots are set to zero (avoid 'na' issues)
+for i = 0 to array.size(accountingArray) - 1
+    if na(array.get(accountingArray, i))
+        array.set(accountingArray, i, 0.0)
+
+// On the very first bar, initialize the real balance
+if barstate.isfirst
+    array.set(accountingArray, 14, InitialCapital)
+    BalanceReal := InitialCapital
+
+// Only run setup after test period starts
+if time >= testPeriodStart    
+    trendTurnedUpPrev = trendTurnedUp[1]
+
+    // Timestamp of First Long execution
+    timeFirstLong := time
+
+    // Store the reference price for the first Long grid level
+    float firstLongLevel = open    
+
+    // Check if Long entries are allowed and trend is confirmed (i.e., second bar of confirmed uptrend)
+    if AllowLongs and (isTrendUp or isTrendUpPrev) and not trendTurnedUp and not (liquidationOccurredLong or liquidationOccurredShort) 
+
+        // Reactivate grid logic if:
+        // (1) The trend turned up in the previous bar (new cycle starts), OR
+        // (2) No previous entry or flat Long position
+        isValidLongEntry = trendTurnedUpPrev or (na(FirstLongTime) or LongPositionSize == 0)
+
+        if isValidLongEntry            
+
+            // Reset long-side variables
+            nLongs := 0
+            nCloseLongs := 0
+            initialLongPositionSize := na
+            LongStopLossActivated := false
+            LongStopLossLimitPrice := na
+
+              // Clear all pending limit orders for Long side
+            array.clear(LongLimitPrices)
+            array.clear(CloseLongLimitPrices)
+
+            // Decide first Long level:
+            array.push(LongLimitPrices, fR(firstLongLevel))    
+                
+            // ==========================================================
+            // ALERT CALL – FIRST LONG ENTRY (MARKET ONLY)
+            // ==========================================================
+
+            // Calculate the quantity and % of capital to use for the first grid Long entry
+            [qtyFirstLongEntry, pctFirstLongEntry] = fGridEntrySizeAndPercent("long", MaxEntries)
+
+            // Estimate the TP level for this first entry (not used in this alert, but could be logged or displayed)
+            float firstTakeProfitPrice = firstLongLevel * (1 + Width / 100)
+
+            // Determine the size and % for the first TP level (TP1)
+            [qtyFirstTakeProfit, pctFirstTakeProfit] = fGridCloseSizeAndPercent("long", 0)
+
+            // Trigger the alert for First Long: opens market position and prepares grid system
+            fAlertFirstLong(
+                 pctFirstLongEntry,  // % of capital for market entry
+                 0                   // Alert slot index
+             )
+
+    // Close Short position after confirmed uptrend reversal (1 bar after trendTurnedUp)
+    if trendTurnedUpPrev and ShortPositionSize > 0
+
+        // Calculate gross PnL from closing the short position
+        float pnl = (AvgShortPrice - firstLongLevel) * ShortPositionSize
+        float commission = ShortPositionSize * firstLongLevel * TakerFee
+
+        // Apply net PnL to balance ===
+        BalanceReal += pnl - commission
+
+        // Update accounting: fees, gains/losses, win counters
+        Commission += commission
+        Losses += commission
+
+        if pnl > 0
+            Gains += pnl
+            nWins += 1
+        else if pnl < 0
+            Losses += math.abs(pnl)
+            nLosses += 1
+
+        // Recalculate full accounting state after initial entry execution
+        fFullAccountingUpdate(BalanceReal)
+
+        // Reset short-side variables
+        ShortPositionSize := 0
+        ShortPositionCash := 0.0
+        AvgShortPrice := na
+        nShorts := 0
+        nCloseShorts := 0
+        initialShortPositionSize := na
+        ShortStopLossActivated := false
+        ShortStopLossLimitPrice := na
+
+        // Draw label (100% exit) if in Short-only mode
+        if AllowShorts and not AllowLongs
+            // Visual label on the chart to mark stop
+            label.new(
+                 bar_index,
+                 firstLongLevel,
+                 "Stop 100%",
+                 style = label.style_label_left,
+                 color = color.new(color.purple, 45),
+                 textcolor = color.new(color.white, 10),
+                 size = fTextSize(LabelSizeInput),
+                 yloc = yloc.price
+             )
+        
+            // ==========================================================
+            // ALERT CALL – STOP LOSS SHORT (FORCED MARKET EXIT)
+            // ==========================================================
+            fAlertStopLossShort(0)
+
+        // Clear all pending limit orders for Short side
+        array.clear(ShortLimitPrices)
+        array.clear(CloseShortLimitPrices)
+    trendTurnedDownPrev = trendTurnedDown[1]
+
+    // Timestamp of First Short execution    
+    timeFirstShort := time
+
+    // Store the reference price for the first Short grid level
+    float firstShortLevel = open
+
+    // Check if Short entries are allowed and trend is confirmed (i.e., second bar of confirmed downtrend)
+    if AllowShorts and (isTrendDown or isTrendDownPrev) and not trendTurnedDown and not (liquidationOccurredLong or liquidationOccurredShort)
+
+        // Reactivate grid logic if:
+        // (1) The trend turned down in the previous bar (new cycle starts), OR
+        // (2) No previous entry or flat Short position
+        isValidShortEntry = trendTurnedDownPrev or (na(FirstShortTime) or ShortPositionSize == 0)
+
+        if isValidShortEntry            
+
+            // Reset short-side variables
+            nShorts := 0
+            nCloseShorts := 0
+            initialShortPositionSize := na
+            ShortStopLossActivated := false
+            ShortStopLossLimitPrice := na
+
+            // Clear all pending limit orders for Short side
+            array.clear(ShortLimitPrices)
+            array.clear(CloseShortLimitPrices)       
+
+            // Decide first Short level:            
+            array.push(ShortLimitPrices, fR(firstShortLevel))
+            
+            // ==========================================================
+            // ALERT CALL – FIRST SHORT ENTRY (MARKET ONLY)
+            // ==========================================================
+
+            // Calculate the quantity and % of capital to use for the first grid Short entry
+            [qtyFirstShortEntry, pctFirstShortEntry] = fGridEntrySizeAndPercent("short", MaxEntries)
+
+            // Estimate the TP level for this first entry (not used in this alert, but could be logged or displayed)
+            float firstTakeProfitPrice = firstShortLevel * (1 - Width / 100)
+
+            // Determine the size and % for the first TP level (TP1)
+            [qtyFirstTakeProfit, pctFirstTakeProfit] = fGridCloseSizeAndPercent("short", 0)
+
+            // Trigger the alert for First Short: opens market position and prepares grid system
+            fAlertFirstShort(
+                 pctFirstShortEntry,  // % of capital for market entry
+                 0                    // Alert slot index
+             )
+
+    // Close Long position after confirmed downtrend reversal (1 bar after trendTurnedDown)
+    if trendTurnedDownPrev and LongPositionSize > 0
+
+        // Calculate gross PnL from closing the long position
+        float pnl = (firstShortLevel - AvgLongPrice) * LongPositionSize
+        float commission = LongPositionSize * firstShortLevel * TakerFee
+
+        // Apply net PnL to balance ===
+        BalanceReal += pnl - commission
+
+        // Update accounting: fees, gains/losses, win counters
+        Commission += commission
+        Losses += commission
+
+        if pnl > 0
+            Gains += pnl
+            nWins += 1
+        else if pnl < 0
+            Losses += math.abs(pnl)
+            nLosses += 1
+
+        // Recalculate full accounting state after initial entry execution
+        fFullAccountingUpdate(BalanceReal)
+
+        // Reset long-side variables
+        LongPositionSize := 0
+        LongPositionCash := 0.0
+        AvgLongPrice := na
+        nLongs := 0
+        nCloseLongs := 0
+        initialLongPositionSize := na
+        LongStopLossActivated := false
+        LongStopLossLimitPrice := na
+
+        // Draw label (100% exit) if in Long-only mode
+        if AllowLongs and not AllowShorts
+            // Visual label on the chart to mark stop
+            label.new(
+                 bar_index,
+                 firstShortLevel,
+                 "Stop 100%",
+                 style = label.style_label_left,
+                 color = color.new(color.purple, 45),
+                 textcolor = color.new(color.white, 10),
+                 size = fTextSize(LabelSizeInput),
+                 yloc = yloc.price
+             )
+        
+            // ==========================================================
+            // ALERT CALL – STOP LOSS SHORT (FORCED MARKET EXIT)
+            // ==========================================================
+            fAlertStopLossLong(0)
+
+        // Clear all pending limit orders for Long side
+        array.clear(LongLimitPrices)
+        array.clear(CloseLongLimitPrices)
+var float canceledLongPrice = na
+// Store the price of the canceled CloseLong, for visual plotting
+var float canceledCloseLongPrice = na
+// Store the price of the canceled StopLoss Long, for visual plotting
+var float canceledStopLongPrice = na
+// Flag to determine if we should fire cancel alert for the Long side
+bool cancelLongSide = false
+
+// Check if there are pending Long limit orders AND the trend turned bearish
+if array.size(LongLimitPrices) > 0 and trendTurnedDown
+    // Get the first pending Long entry price (oldest one) de forma temporal
+    tempLongPrice = array.get(LongLimitPrices, 0)
+    
+    // Only cancel if the order is below or equal to the bearish SuperTrend band
+    if tempLongPrice <= lowerBand
+        canceledLongPrice := tempLongPrice
+        array.clear(LongLimitPrices)
+        cancelLongSide := true
+
+// Check if there are pending CloseLong orders AND the trend turned bearish
+if array.size(CloseLongLimitPrices) > 0 and trendTurnedDown
+    // Get the first CloseLong level
+    canceledCloseLongPrice := array.get(CloseLongLimitPrices, 0)
+    array.clear(CloseLongLimitPrices)      // Remove all CloseLong orders
+    cancelLongSide := true                 // Mark that we need to send the alert
+
+// Check if there is an active StopLoss AND it’s below the lowerBand AND trend turned bearish
+if not na(LongStopLossLimitPrice) and trendTurnedDown and LongStopLossLimitPrice <= lowerBand
+    canceledStopLongPrice := LongStopLossLimitPrice
+    LongStopLossLimitPrice := na
+    cancelLongSide := true
+var float canceledShortPrice = na
+// Store the price of the canceled CloseShort, for visual plotting
+var float canceledCloseShortPrice = na
+// Store the price of the canceled StopLoss Short, for visual plotting
+var float canceledStopShortPrice = na
+// Flag to determine if we should fire cancel alert for the Short side
+bool cancelShortSide = false
+
+// Check if there are pending Short limit orders AND the trend turned bullish
+if array.size(ShortLimitPrices) > 0 and trendTurnedUp
+    // Get the first pending Short entry price (oldest one) only temporarily
+    tempShortPrice = array.get(ShortLimitPrices, 0)
+    
+    // Only cancel if the order is above or equal to the bullish SuperTrend band
+    if tempShortPrice >= upperBand
+        canceledShortPrice := tempShortPrice       // Assign only if truly cancelled
+        array.clear(ShortLimitPrices)              // Remove all Short entry orders
+        cancelShortSide := true                    // Mark that we need to send the alert
+
+// Check if there are pending CloseShort orders AND the trend turned bullish
+if array.size(CloseShortLimitPrices) > 0 and trendTurnedUp
+    // Get the first CloseShort level
+    canceledCloseShortPrice := array.get(CloseShortLimitPrices, 0)
+    array.clear(CloseShortLimitPrices)     // Remove all CloseShort orders
+    cancelShortSide := true                // Mark that we need to send the alert
+
+// Check if there is an active StopLoss AND it's above the upperBand AND trend turned bullish
+if not na(ShortStopLossLimitPrice) and trendTurnedUp and ShortStopLossLimitPrice >= upperBand
+    canceledStopShortPrice := ShortStopLossLimitPrice
+    ShortStopLossLimitPrice := na
+    cancelShortSide := true
+var float longExecPrice = na
+
+// Initialize trade counter for current bar
+var int longTradesThisBar = 0
+
+// Reset trade counter at the start of a new bar
+if bar_index != bar_index[1]
+    longTradesThisBar := 0
+
+// Run execution logic only within the test period
+if time >= testPeriodStart
+    var executedLongIndexes = array.new_int()
+
+    // Proceed only if Longs are allowed and there are pending Long limit orders
+    if AllowLongs and array.size(LongLimitPrices) > 0
+
+        // Clear any active Short-side structures (since we're going Long now)
+        array.clear(ShortLimitPrices)
+        array.clear(CloseShortLimitPrices)
+        ShortStopLossActivated := false
+        ShortStopLossLimitPrice := na
+
+        // Reset Long cash and avg price tracking if there's no active Long position
+        if LongPositionSize == 0
+            LongPositionCash := 0.0
+            AvgLongPrice := na
+
+        // Iterate through each Long limit level
+        for longIndex = 0 to array.size(LongLimitPrices) - 1
+            limitPrice = array.get(LongLimitPrices, longIndex)
+
+            // Skip if the price is invalid (na)
+            if not na(limitPrice)
+
+                // Condition A: candle crossed through the level (typical wick)
+                bool crossedThrough = low <= limitPrice and open >= limitPrice
+
+                // Condition B: gap-down candle (open below level)
+                bool gapDownEntry = open < limitPrice
+
+                // Decide whether to execute Long based on either condition
+                bool executeLong = crossedThrough or gapDownEntry
+
+                // If any condition is valid, execute the Long
+                if executeLong
+
+                    // Determine at which price to execute: open or limit price
+                    float execPrice = gapDownEntry ? open : limitPrice
+
+                    // Log this index for cleanup after execution
+                    array.push(executedLongIndexes, longIndex)
+
+                    // Calculate how much to buy and what % of balance to use
+                    [entryQty, entryPct] = fGridEntrySizeAndPercent("long", MaxEntries)
+
+                    // Only proceed if the amount to buy is positive
+                    if entryQty > 0
+                        // Reset TP counters, increase Long counters
+                        nCloseLongs := 0
+                        nLongs += 1
+                        longTradesThisBar += 1
+
+                        // Clear any pending TPs and store this execution
+                        array.clear(CloseLongLimitPrices)
+                        array.push(LongPrices, fR(execPrice))
+                        array.push(CloseLongPrices, na)
+                        array.push(LongBarIndexes, bar_index)
+                        TotalLongsExecuted += 1
+                        LongStopLossActivated := false
+                        barIndexLong := bar_index
+
+                        // Update position size and cash exposure
+                        contracts = entryQty / execPrice
+                        LongPositionCash += entryQty
+                        LongPositionSize += contracts
+
+                        // Add Long-side executed volume to total
+                        totalVolume += entryQty
+
+                        // Update the weighted average entry price
+                        AvgLongPrice := na(AvgLongPrice)
+                             ? execPrice
+                             : ((AvgLongPrice * (LongPositionSize - contracts)) + (execPrice * contracts)) / LongPositionSize
+
+                        // Record time and price of first Long (if not already)
+                        if na(FirstLongPrice)
+                            FirstLongPrice := execPrice
+                        if na(FirstLongTime)
+                            FirstLongTime := time
+
+                        // Only apply Taker commission for the first Long of the cycle (nLongs == 1)
+                        commissionRate = (isTrendUp and trendTurnedUp[1] and nLongs == 1) ? TakerFee : MakerFee
+                        // Calculate commission for this Long entry
+                        commission = entryQty * commissionRate
+                        // Add commission to cumulative total
+                        Commission += commission
+                        // Track commission as a realized cost (loss)
+                        Losses += commission
+                        // Deduct commission from real account balance
+                        BalanceReal -= commission
+
+                        // Create a visual label on the chart with % used
+                        entryPct := math.min(entryPct, 100)
+                        if not na(entryPct)
+                            longLabelText = "L" + str.tostring(nLongs) + " " + str.tostring(entryPct, '#.#') + "%"
+                            label.new(
+                                 bar_index,
+                                 execPrice,
+                                 longLabelText,
+                                 style = label.style_label_left,
+                                 color = color.new(color.aqua, 45),
+                                 textcolor = color.new(color.white, 10),
+                                 size = fTextSize(LabelSizeInput),
+                                 yloc = yloc.price
+                             )
+
+                        // Recalculate all balances, PnL, etc.
+                        fFullAccountingUpdate(BalanceReal)
+
+                        // ==========================================================
+                        // PREPARE NEXT GRID LEVELS AND ALERT PARAMETERS
+                        // ==========================================================
+
+                        // Store last executed Long for reference
+                        longExecPrice := execPrice
+
+                        // Calculate next grid Long and TP levels
+                        nextLongLevelPrice = fR(execPrice * (1 - Width / 100))
+                        nextTakeProfitPrice = fR(execPrice * (1 + Width / 100))
+
+                        // Calculate allocation for the next grid Long and its TP
+                        [nextEntryQty, nextEntryPct] = fGridEntrySizeAndPercent("long", MaxEntries)
+                        [nextCloseQty, nextClosePct] = fGridCloseSizeAndPercent("long", 0)
+
+                        // Check if the next Long level is above SuperTrend support
+                        bool isNextLongAboveSupport = nextLongLevelPrice > lowerBand
+                        // Check if we are allowed to add a new Long entry
+                        bool canAddNextLong = nLongs <= MaxEntries - 1 and nextLongLevelPrice > 0 and (isTrendUp or trendTurnedUp)
+                        // Add next Long limit order if all conditions are met
+                        if canAddNextLong and isNextLongAboveSupport
+                            // Push the next Long price into the LongLimitPrices array
+                            array.push(LongLimitPrices, fR(nextLongLevelPrice))
+
+                        // Check if we are allowed to add a new Take Profit (CloseLong)
+                        bool canAddNextTP = nCloseLongs <= MaxCloseLevels - 1
+                        // Add next CloseLong level if within allowed limit
+                        if canAddNextTP
+                            // Push the next take profit price into the CloseLongLimitPrices array
+                            array.push(CloseLongLimitPrices, fR(nextTakeProfitPrice))
+
+                        // Calculate candidate StopLoss using the lower value between entry price and average price
+                        float candidateSL = fR(math.min(execPrice, AvgLongPrice) * (1 - Width / 100))
+                        // Check if candidate SL respects the SuperTrend support structure
+                        bool isSLValid = candidateSL > lowerBand                        
+                        // Apply StopLoss logic if all criteria are met
+                        if isSLValid
+                            // Assign candidateSL to LongStopLossLimitPrice
+                            LongStopLossLimitPrice := candidateSL
+                            // Check if the StopLoss would overlap the next Long level
+                            bool overlapsNextEntry = not na(nextLongLevelPrice) and candidateSL >= nextLongLevelPrice and nLongs < MaxEntries
+                            // If it overlaps, apply a slight downward offset to avoid execution conflict
+                            if overlapsNextEntry
+                                float smallOffset = Width * 0.10 / 100  // Offset factor based on Width
+                                LongStopLossLimitPrice := fR(nextLongLevelPrice * (1 - smallOffset))
+                        else
+                            // Clear the StopLoss if invalid or not in last-entry condition
+                            LongStopLossLimitPrice := na
+
+                        // ==========================================================
+                        // ALERT CALL – GRID LONG CONFIGURATION (LIMIT + SL + TP)
+                        // ==========================================================                        
+
+                        // Trigger alert only if a small buffer has passed since first Long
+                        if timenow > (nz(timeFirstLong) + 5000)
+                            fAlertGridLong(
+                                 fR(nextLongLevelPrice),    // Next grid limit Long
+                                 nextEntryPct,              // % capital to allocate
+                                 fR(nextTakeProfitPrice),   // TP price
+                                 nextClosePct,              // % to close at TP
+                                 nLongs                     // Alert slot ID
+                             )
+
+    // Clean up executed Long levels after loop
+    if array.size(executedLongIndexes) > 0
+        array.sort(executedLongIndexes, order.descending)
+        for idx in executedLongIndexes
+            if idx >= 0 and idx < array.size(LongLimitPrices)
+                array.remove(LongLimitPrices, idx)
+        array.clear(executedLongIndexes)
+var float shortExecPrice = na
+
+// Initialize trade counter for the current bar
+var int shortTradesThisBar = 0
+
+// Reset trade counter at the start of a new bar
+if bar_index != bar_index[1]
+    shortTradesThisBar := 0
+
+// Run execution logic only within the test period
+if time >= testPeriodStart
+    var executedShortIndexes = array.new_int()
+
+    // Proceed only if Shorts are allowed and there are pending Short limit orders
+    if AllowShorts and array.size(ShortLimitPrices) > 0
+
+        // Clear any active Long-side structures (since we're going Short now)
+        array.clear(LongLimitPrices)
+        array.clear(CloseLongLimitPrices)
+        LongStopLossActivated := false
+        LongStopLossLimitPrice := na
+
+        // Reset Short cash and avg price tracking if there's no active Short position
+        if ShortPositionSize == 0
+            ShortPositionCash := 0.0
+            AvgShortPrice := na
+
+        // Iterate through each Short limit level
+        for shortIndex = 0 to array.size(ShortLimitPrices) - 1
+            limitPrice = array.get(ShortLimitPrices, shortIndex)
+
+            // Skip if the price is invalid (na)
+            if not na(limitPrice)
+
+                // Condition A: candle crossed through the level (typical wick)
+                bool crossedThrough = open <= limitPrice and high >= limitPrice
+
+                // Condition B: gap-up candle (open above level)
+                bool gapUpEntry = open > limitPrice
+
+                // Decide whether to execute Short based on either condition
+                bool executeShort = crossedThrough or gapUpEntry
+
+                // If any condition is valid, execute the Short
+                if executeShort
+
+                    // Determine at which price to execute: open or limit price
+                    float execPrice = gapUpEntry ? open : limitPrice
+
+                    // Log this index for cleanup after execution
+                    array.push(executedShortIndexes, shortIndex)
+
+                    // Calculate how much to sell and what % of balance to use
+                    [entryQty, entryPct] = fGridEntrySizeAndPercent("short", MaxEntries)
+
+                    // Only proceed if the amount to sell is positive
+                    if entryQty > 0
+                        // Reset TP counters, increase Short counters
+                        nCloseShorts := 0
+                        nShorts += 1
+                        shortTradesThisBar += 1
+
+                        // Clear any pending TPs and store this execution
+                        array.clear(CloseShortLimitPrices)
+                        array.push(ShortPrices, fR(execPrice))
+                        array.push(CloseShortPrices, na)
+                        array.push(ShortBarIndexes, bar_index)
+                        TotalShortsExecuted += 1
+                        ShortStopLossActivated := false
+                        barIndexShort := bar_index
+
+                        // Update position size and cash exposure
+                        contracts = entryQty / execPrice
+                        ShortPositionCash += entryQty
+                        ShortPositionSize += contracts
+
+                        // Add Short-side executed volume to total
+                        totalVolume += entryQty
+
+                        // Update the weighted average entry price
+                        AvgShortPrice := ShortPositionSize == contracts ? execPrice : ((AvgShortPrice * (ShortPositionSize - contracts)) + (execPrice * contracts)) / ShortPositionSize
+
+                        // Record time and price of first Short (if not already)
+                        if na(FirstShortPrice)
+                            FirstShortPrice := execPrice
+                        if na(FirstShortTime)
+                            FirstShortTime := time
+
+                        // Only apply Taker commission for the first Short of the cycle (nShorts == 1)
+                        commissionRate = (isTrendDown and trendTurnedDown[1] and nShorts == 1) ? TakerFee : MakerFee
+                        // Calculate commission for this Short entry
+                        commission = entryQty * commissionRate
+                        // Add commission to cumulative total
+                        Commission += commission
+                        // Track commission as a realized cost (loss)
+                        Losses += commission
+                        // Deduct commission from real account balance
+                        BalanceReal -= commission
+
+                        // Create a visual label on the chart with % used
+                        entryPct := math.min(entryPct, 100)
+                        if not na(entryPct)
+                            shortLabelText = "S" + str.tostring(nShorts) + " " + str.tostring(entryPct, '#.#') + "%"
+                            label.new(
+                                 bar_index,
+                                 execPrice,
+                                 shortLabelText,
+                                 style = label.style_label_left,
+                                 color = color.new(color.red, 45),
+                                 textcolor = color.new(color.white, 10),
+                                 size = fTextSize(LabelSizeInput),
+                                 yloc = yloc.price
+                             )
+
+                        // Recalculate all balances, PnL, etc.
+                        fFullAccountingUpdate(BalanceReal)
+
+                        // ==========================================================
+                        // PREPARE NEXT GRID LEVELS AND ALERT PARAMETERS
+                        // ==========================================================
+
+                        // Store last executed Short for reference
+                        shortExecPrice := execPrice
+
+                        // Calculate next grid Short and TP levels
+                        nextShortLevelPrice = fR(execPrice * (1 + Width / 100))
+                        nextTakeProfitPrice = fR(execPrice * (1 - Width / 100))
+
+                        // Calculate allocation for the next grid Short and its TP
+                        [nextEntryQty, nextEntryPct] = fGridEntrySizeAndPercent("short", MaxEntries)
+                        [nextCloseQty, nextClosePct] = fGridCloseSizeAndPercent("short", 0)
+
+                        // Check if the next Short level is below SuperTrend resistance
+                        bool isNextShortBelowResistance = nextShortLevelPrice < upperBand                        
+                        // Check if we are allowed to add a new Short entry
+                        bool canAddNextShort = nShorts <= MaxEntries - 1 and nextShortLevelPrice > 0 and (isTrendDown or trendTurnedDown)
+                        // Add next Short limit order if all conditions are met
+                        if canAddNextShort and isNextShortBelowResistance
+                            // Push the next Short price into the ShortLimitPrices array
+                            array.push(ShortLimitPrices, fR(nextShortLevelPrice))
+
+                        // Check if we are allowed to add a new Take Profit (CloseShort)
+                        bool canAddNextTP = nCloseShorts <= MaxCloseLevels - 1
+                        // Add next CloseShort level if within allowed limit
+                        if canAddNextTP
+                            // Push the next take profit price into the CloseShortLimitPrices array
+                            array.push(CloseShortLimitPrices, fR(nextTakeProfitPrice))
+
+                        // Calculate candidate StopLoss using the higher value between entry price and average price
+                        float candidateSL = fR(math.max(execPrice, AvgShortPrice) * (1 + Width / 100))
+                        // Check if candidate SL respects the SuperTrend resistance structure
+                        bool isSLValid = candidateSL < upperBand
+                        // Apply StopLoss logic if all criteria are met
+                        if isSLValid
+                            // Assign candidateSL to ShortStopLossLimitPrice
+                            ShortStopLossLimitPrice := candidateSL
+                            // Check if the StopLoss would overlap the next Short level
+                            bool overlapsNextEntry = not na(nextShortLevelPrice) and candidateSL <= nextShortLevelPrice and nShorts < MaxEntries
+                            // If it overlaps, apply a slight upward offset to avoid execution conflict
+                            if overlapsNextEntry
+                                float smallOffset = Width * 0.10 / 100  // Offset factor based on Width
+                                ShortStopLossLimitPrice := fR(nextShortLevelPrice * (1 + smallOffset))
+                        else
+                            // Clear the StopLoss if invalid or not in last-entry condition
+                            ShortStopLossLimitPrice := na
+
+                        // ==========================================================
+                        // ALERT CALL – GRID SHORT CONFIGURATION (LIMIT + SL + TP)
+                        // ==========================================================
+
+                        // Trigger alert only if a small buffer has passed since first Short
+                        if timenow > (nz(timeFirstShort) + 5000)
+                            fAlertGridShort(
+                                 fR(nextShortLevelPrice),   // Next grid limit Short
+                                 nextEntryPct,              // % capital to allocate
+                                 fR(nextTakeProfitPrice),   // TP price
+                                 nextClosePct,              // % to close at TP
+                                 nShorts                    // Alert slot ID
+                             )
+
+    // Clean up executed Short levels after loop
+    if array.size(executedShortIndexes) > 0
+        array.sort(executedShortIndexes, order.descending)
+        for idx in executedShortIndexes
+            if idx >= 0 and idx < array.size(ShortLimitPrices)
+                array.remove(ShortLimitPrices, idx)
+        array.clear(executedShortIndexes)
+if array.size(LongLimitPrices) > 0 and trendTurnedDown
+    // Get the first pending Long entry price (oldest one) de forma temporal
+    tempLongPrice = array.get(LongLimitPrices, 0)
+    
+    // Only cancel if the order is below or equal to the bearish SuperTrend band
+    if tempLongPrice <= lowerBand
+        canceledLongPrice := tempLongPrice
+        array.clear(LongLimitPrices)
+        cancelLongSide := true
+
+// Check if there are pending CloseLong orders AND the trend turned bearish
+if array.size(CloseLongLimitPrices) > 0 and trendTurnedDown
+    // Get the first CloseLong level
+    canceledCloseLongPrice := array.get(CloseLongLimitPrices, 0)
+    array.clear(CloseLongLimitPrices)      // Remove all CloseLong orders
+    cancelLongSide := true                 // Mark that we need to send the alert
+
+// Check if there is an active StopLoss AND it’s below the lowerBand AND trend turned bearish
+if not na(LongStopLossLimitPrice) and trendTurnedDown and LongStopLossLimitPrice <= lowerBand
+    canceledStopLongPrice := LongStopLossLimitPrice
+    LongStopLossLimitPrice := na
+    cancelLongSide := true
+if array.size(ShortLimitPrices) > 0 and trendTurnedUp
+    // Get the first pending Short entry price (oldest one) only temporarily
+    tempShortPrice = array.get(ShortLimitPrices, 0)
+    
+    // Only cancel if the order is above or equal to the bullish SuperTrend band
+    if tempShortPrice >= upperBand
+        canceledShortPrice := tempShortPrice       // Assign only if truly cancelled
+        array.clear(ShortLimitPrices)              // Remove all Short entry orders
+        cancelShortSide := true                    // Mark that we need to send the alert
+
+// Check if there are pending CloseShort orders AND the trend turned bullish
+if array.size(CloseShortLimitPrices) > 0 and trendTurnedUp
+    // Get the first CloseShort level
+    canceledCloseShortPrice := array.get(CloseShortLimitPrices, 0)
+    array.clear(CloseShortLimitPrices)     // Remove all CloseShort orders
+    cancelShortSide := true                // Mark that we need to send the alert
+
+// Check if there is an active StopLoss AND it's above the upperBand AND trend turned bullish
+if not na(ShortStopLossLimitPrice) and trendTurnedUp and ShortStopLossLimitPrice >= upperBand
+    canceledStopShortPrice := ShortStopLossLimitPrice
+    ShortStopLossLimitPrice := na
+    cancelShortSide := true
+var float CloseLongExecPrice = na
+
+// Array to track executed CloseLong indexes (to remove them later)
+var executedCloseLongIndexes = array.new_int()
+
+// Save initial position size when first Long is open
+if LongPositionSize > 0 and (na(initialLongPositionSize) or initialLongPositionSize == 0)
+    initialLongPositionSize := LongPositionSize
+
+// Check if there are active CloseLong levels and position is still open
+if array.size(CloseLongLimitPrices) > 0 and LongPositionSize > 0
+    for i = 0 to array.size(CloseLongLimitPrices) - 1
+
+        // Retrieve CloseLong limit price from array
+        CloseLongLimitPrice = array.get(CloseLongLimitPrices, i)
+
+        // Proceed only if this CloseLong level is valid
+        if not na(CloseLongLimitPrice)
+        
+            // ----------------------------------------------------------
+            // CONDITION A – Wick-based TP:
+            // Price must wick through the TP level intrabar (high >= level),
+            // open must be below it (open <= level),
+            // and if it's the same bar as the Long entry, there must be bullish pressure.
+            // The bullish pressure is evaluated using non-repainting structural signals,
+            // including position of the open and shape of the candle.
+            // On later bars, the pressure filter is ignored.
+            bool wickCrossedTP = 
+                 high >= CloseLongLimitPrice and                        // Price wicked above the Take Profit level
+                 open <= CloseLongLimitPrice and                        // Open was below the TP level
+                 (
+                     barIndexLong != bar_index or                       // Allow by default on later bars
+                     (
+                         close > open or                                // Bullish candle body
+                         hl2 > open or                                  // Candle's midpoint above open
+                         hlc3 > open or                                 // Average of High, Low, Close above open
+                         ohlc4 > open or                                // Average of Open, High, Low, Close above open
+                         hlcc4 > open                                   // Weighted average of High, Low, Close, Close above open
+                     )
+                 )
+
+            // ----------------------------------------------------------
+            // CONDITION B – Gap-up TP:
+            // Candle opened above the level and no CloseLong was triggered this bar
+            bool gapUpEntry = open > CloseLongLimitPrice and barIndexLong != bar_index
+
+            // ----------------------------------------------------------
+            // FINAL DECISION: price action is valid
+            bool AllowCloseLong = wickCrossedTP or gapUpEntry            
+
+            // Get current CloseLong quantity and percentage
+            [CloseLongQty, CloseLongPct] = fGridCloseSizeAndPercent("long", nCloseLongs)
+            CloseLongQty := math.min(LongPositionSize, math.max(CloseLongQty, 0.0))
+
+            // Check that TP is above StopLoss
+            CloseLongValid = na(LongStopLossLimitPrice) or CloseLongLimitPrice > LongStopLossLimitPrice
+
+            // Activate CloseLong if all conditions met
+            ActivateClose = CloseLongQty > 0 and AllowCloseLong and CloseLongValid
+
+            // Prepare next CloseLong quantity and percentage for alerts
+            [NextCloseLongQty, NextCloseLongPct] = fGridCloseSizeAndPercent("long", nCloseLongs + 1)
+            NextCloseLongQty := math.min(LongPositionSize, math.max(NextCloseLongQty, 0.0))
+
+            if ActivateClose
+
+                // Determine execution price based on entry type
+                float CloseLongPriceExecuted = gapUpEntry ? open : CloseLongLimitPrice
+
+                // Register this CloseLong execution index
+                array.push(executedCloseLongIndexes, i)
+
+                // Save execution bar index
+                barIndexCloseLong := bar_index
+
+                // Reset Long counter and increment CloseLongs
+                nLongs := 0
+                nCloseLongs += 1
+                TotalClosesExecuted += 1
+
+                // Clear pending Long entries
+                array.clear(LongLimitPrices)
+
+                // Update remaining position size and cash
+                LongPositionCash := math.max(0.0, LongPositionCash * (LongPositionSize / (LongPositionSize + CloseLongQty)))
+                LongPositionSize := math.max(0.0, LongPositionSize - CloseLongQty)
+
+                // Calculate PnL and commission
+                CloseLongPnL = (CloseLongPriceExecuted - AvgLongPrice) * CloseLongQty
+                CloseLongFee = CloseLongQty * CloseLongPriceExecuted * MakerFee
+
+                // Apply trading fee to commission and loss records ===
+                Commission += CloseLongFee
+                Losses += CloseLongFee
+
+                // Update net balance after closing the long position ===
+                BalanceReal += CloseLongPnL - CloseLongFee
+
+                // === Allocate gross PnL to Gains or Losses (excluding fee) ===
+                if CloseLongPnL > 0
+                    Gains += CloseLongPnL
+                    nWins += CloseLongPct / 100
+                else if CloseLongPnL < 0
+                    Losses += math.abs(CloseLongPnL)
+                    nLosses += CloseLongPct / 100
+
+                // Label chart with % closed
+                if not na(CloseLongPct)
+                    label.new(
+                         bar_index,
+                         CloseLongPriceExecuted,
+                         "C" + str.tostring(nCloseLongs) + " " + str.tostring(CloseLongPct, '#.#') + "%",
+                         style = label.style_label_left,
+                         color = color.new(color.orange, 45),
+                         textcolor = color.new(color.white, 10),
+                         size = fTextSize(LabelSizeInput),
+                         yloc = yloc.price
+                     )
+
+                // Save last CloseLong execution price
+                CloseLongExecPrice := CloseLongPriceExecuted
+
+                // Refresh account state
+                fFullAccountingUpdate(BalanceReal)
+
+                // Prepare next grid level prices
+                NextLongLimitPrice = CloseLongPriceExecuted * (1 - Width / 100)
+                NextCloseLongLimitPrice = CloseLongPriceExecuted * (1 + Width / 100)
+
+                // Add next Long if trend allows and not below SL
+                if nLongs <= MaxEntries - 1 and (na(LongStopLossLimitPrice) or NextLongLimitPrice > LongStopLossLimitPrice) and (isTrendUp or trendTurnedUp)
+                    array.push(LongLimitPrices, fR(NextLongLimitPrice))
+
+                // Add next CloseLong if conditions met
+                if nCloseLongs <= MaxCloseLevels - 1 and (na(LongStopLossLimitPrice) or NextCloseLongLimitPrice > LongStopLossLimitPrice)
+                    array.push(CloseLongLimitPrices, fR(NextCloseLongLimitPrice))
+
+                // ==========================================================
+                // ALERT CALL – GRID CLOSE LONG CONFIGURATION (LIMIT + SL + TP)
+                // ==========================================================
+
+                // Prepare alert values for next grid level
+                [NextLongQty, NextLongPct] = fGridEntrySizeAndPercent("long", MaxEntries)
+                CloseLongTPpct = NextCloseLongPct
+
+                // Optional fallback SL price
+                SafeCloseLongSL = not na(LongStopLossLimitPrice) ? LongStopLossLimitPrice : NextLongLimitPrice * (1 - Width / 100)
+
+                // Send alert
+                fAlertCloseLongEntry(
+                     fR(NextLongLimitPrice),
+                     NextLongPct,
+                     fR(NextCloseLongLimitPrice),
+                     CloseLongTPpct,
+                     nCloseLongs - 1
+                 )
+
+// Clean up executed CloseLong levels
+if array.size(executedCloseLongIndexes) > 0
+    array.sort(executedCloseLongIndexes, order.descending)
+    for i = 0 to array.size(executedCloseLongIndexes) - 1
+        idx = array.get(executedCloseLongIndexes, i)
+        if idx >= 0 and idx < array.size(CloseLongLimitPrices)
+            array.remove(CloseLongLimitPrices, idx)
+    array.clear(executedCloseLongIndexes)
+var float CloseShortExecPrice = na
+
+// Array to track executed CloseShort indexes (to remove them later)
+var executedCloseShortIndexes = array.new_int()
+
+// Save initial position size when first Short is open
+if ShortPositionSize > 0 and (na(initialShortPositionSize) or initialShortPositionSize == 0)
+    initialShortPositionSize := ShortPositionSize
+
+// Check if there are active CloseShort levels and position is still open
+if array.size(CloseShortLimitPrices) > 0 and ShortPositionSize > 0
+    for i = 0 to array.size(CloseShortLimitPrices) - 1
+
+        // Retrieve CloseShort limit price from array
+        CloseShortLimitPrice = array.get(CloseShortLimitPrices, i)
+
+        // Proceed only if this CloseShort level is valid
+        if not na(CloseShortLimitPrice)
+            bool wickCrossedTP = 
+                 low <= CloseShortLimitPrice and                          // Price wicked below the Take Profit level
+                 open >= CloseShortLimitPrice and                         // Open was above the TP level
+                 (
+                     barIndexShort != bar_index or                        // Allow by default on later bars
+                     (
+                         close < open or                                  // Bearish candle body
+                         hl2 < open or                                    // Candle's midpoint below open
+                         hlc3 < open or                                   // Average of High, Low, Close below open
+                         ohlc4 < open or                                  // Average of Open, High, Low, Close below open
+                         hlcc4 < open                                     // Weighted average of High, Low, Close, Close below open
+                     )
+                 )
+
+            // ----------------------------------------------------------
+            // CONDITION B – Gap-down TP:
+            // Candle opened below the TP level and no CloseShort has been triggered this bar
+            bool gapDownEntry = open < CloseShortLimitPrice and barIndexShort != bar_index
+
+            // ----------------------------------------------------------
+            // F DECISION: price action is valid
+            bool AllowCloseShort = wickCrossedTP or gapDownEntry 
+
+            // Get current CloseShort quantity and percentage
+            [CloseShortQty, CloseShortPct] = fGridCloseSizeAndPercent("short", nCloseShorts)
+            CloseShortQty := math.min(ShortPositionSize, math.max(CloseShortQty, 0.0))
+
+            // Check that TP is below StopLoss
+            CloseShortValid = na(ShortStopLossLimitPrice) or CloseShortLimitPrice < ShortStopLossLimitPrice
+
+            // Activate CloseShort if all conditions met
+            ActivateClose = CloseShortQty > 0 and AllowCloseShort and CloseShortValid
+
+            // Prepare next CloseShort quantity and percentage for alerts
+            [NextCloseShortQty, NextCloseShortPct] = fGridCloseSizeAndPercent("short", nCloseShorts + 1)
+            NextCloseShortQty := math.min(ShortPositionSize, math.max(NextCloseShortQty, 0.0))
+
+            if ActivateClose
+
+                // Determine execution price based on entry type
+                float CloseShortPriceExecuted = gapDownEntry ? open : CloseShortLimitPrice
+
+                // Register this CloseShort execution index
+                array.push(executedCloseShortIndexes, i)
+
+                // Save execution bar index
+                barIndexCloseShort := bar_index
+
+                // Reset Short counter and increment CloseShorts
+                nShorts := 0
+                nCloseShorts += 1
+                TotalShortClosesExecuted += 1
+
+                // Clear pending Short entries
+                array.clear(ShortLimitPrices)
+
+                // Update remaining position size and cash
+                ShortPositionCash := math.max(0.0, ShortPositionCash * (ShortPositionSize / (ShortPositionSize + CloseShortQty)))
+                ShortPositionSize := math.max(0.0, ShortPositionSize - CloseShortQty)
+
+                // Calculate PnL and commission
+                CloseShortPnL = (AvgShortPrice - CloseShortPriceExecuted) * CloseShortQty
+                CloseShortFee = CloseShortQty * CloseShortPriceExecuted * MakerFee
+
+                // Apply trading fee to commission and loss records ===
+                Commission += CloseShortFee
+                Losses += CloseShortFee
+
+                // Update net balance after closing the short position ===
+                BalanceReal += CloseShortPnL - CloseShortFee
+                
+                // Allocate gross PnL to Gains or Losses (excluding fee) ===
+                if CloseShortPnL > 0
+                    Gains += CloseShortPnL
+                    nWins += CloseShortPct / 100
+                else if CloseShortPnL < 0
+                    Losses += math.abs(CloseShortPnL)
+                    nLosses += CloseShortPct / 100
+
+                // Label chart with % closed
+                if not na(CloseShortPct)
+                    label.new(
+                         bar_index,
+                         CloseShortPriceExecuted,
+                         "C" + str.tostring(nCloseShorts) + " " + str.tostring(CloseShortPct, '#.#') + "%",
+                         style = label.style_label_left,
+                         color = color.new(color.green, 45),
+                         textcolor = color.new(color.white, 10),
+                         size = fTextSize(LabelSizeInput),
+                         yloc = yloc.price
+                     )
+
+                // Save last CloseShort execution price
+                CloseShortExecPrice := CloseShortPriceExecuted
+
+                // Refresh account state
+                fFullAccountingUpdate(BalanceReal)
+
+                // Prepare next grid level prices
+                NextShortLimitPrice = CloseShortPriceExecuted * (1 + Width / 100)
+                NextCloseShortLimitPrice = CloseShortPriceExecuted * (1 - Width / 100)
+
+                // Add next Short if trend allows and not above SL
+                if nShorts <= MaxEntries - 1 and (na(ShortStopLossLimitPrice) or NextShortLimitPrice < ShortStopLossLimitPrice) and (isTrendDown or trendTurnedDown)
+                    array.push(ShortLimitPrices, fR(NextShortLimitPrice))
+
+                // Add next CloseShort if conditions met
+                if nCloseShorts <= MaxCloseLevels - 1 and (na(ShortStopLossLimitPrice) or NextCloseShortLimitPrice < ShortStopLossLimitPrice)
+                    array.push(CloseShortLimitPrices, fR(NextCloseShortLimitPrice))
+
+                // ==========================================================
+                // ALERT CALL – GRID CLOSE SHORT CONFIGURATION (LIMIT + SL + TP)
+                // ==========================================================
+
+                // Prepare alert values for next grid level
+                [NextShortQty, NextShortPct] = fGridEntrySizeAndPercent("short", MaxEntries)
+                CloseShortTPpct = NextCloseShortPct
+
+                // Optional fallback SL price
+                SafeCloseShortSL = not na(ShortStopLossLimitPrice) ? ShortStopLossLimitPrice : NextShortLimitPrice * (1 + Width / 100)
+
+                // Send alert
+                fAlertCloseShortEntry(
+                     fR(NextShortLimitPrice),
+                     NextShortPct,
+                     fR(NextCloseShortLimitPrice),
+                     CloseShortTPpct,
+                     nCloseShorts - 1
+                 )
+
+// Clean up executed CloseShort levels
+if array.size(executedCloseShortIndexes) > 0
+    array.sort(executedCloseShortIndexes, order.descending)
+    for i = 0 to array.size(executedCloseShortIndexes) - 1
+        idx = array.get(executedCloseShortIndexes, i)
+        if idx >= 0 and idx < array.size(CloseShortLimitPrices)
+            array.remove(CloseShortLimitPrices, idx)
+    array.clear(executedCloseShortIndexes)
+if array.size(LongLimitPrices) > 0 and trendTurnedDown
+    // Get the first pending Long entry price (oldest one) de forma temporal
+    tempLongPrice = array.get(LongLimitPrices, 0)
+    
+    // Only cancel if the order is below or equal to the bearish SuperTrend band
+    if tempLongPrice <= lowerBand
+        canceledLongPrice := tempLongPrice
+        array.clear(LongLimitPrices)
+        cancelLongSide := true
+
+// Check if there are pending CloseLong orders AND the trend turned bearish
+if array.size(CloseLongLimitPrices) > 0 and trendTurnedDown
+    // Get the first CloseLong level
+    canceledCloseLongPrice := array.get(CloseLongLimitPrices, 0)
+    array.clear(CloseLongLimitPrices)      // Remove all CloseLong orders
+    cancelLongSide := true                 // Mark that we need to send the alert
+
+// Check if there is an active StopLoss AND it’s below the lowerBand AND trend turned bearish
+if not na(LongStopLossLimitPrice) and trendTurnedDown and LongStopLossLimitPrice <= lowerBand
+    canceledStopLongPrice := LongStopLossLimitPrice
+    LongStopLossLimitPrice := na
+    cancelLongSide := true
+if array.size(ShortLimitPrices) > 0 and trendTurnedUp
+    // Get the first pending Short entry price (oldest one) only temporarily
+    tempShortPrice = array.get(ShortLimitPrices, 0)
+    
+    // Only cancel if the order is above or equal to the bullish SuperTrend band
+    if tempShortPrice >= upperBand
+        canceledShortPrice := tempShortPrice       // Assign only if truly cancelled
+        array.clear(ShortLimitPrices)              // Remove all Short entry orders
+        cancelShortSide := true                    // Mark that we need to send the alert
+
+// Check if there are pending CloseShort orders AND the trend turned bullish
+if array.size(CloseShortLimitPrices) > 0 and trendTurnedUp
+    // Get the first CloseShort level
+    canceledCloseShortPrice := array.get(CloseShortLimitPrices, 0)
+    array.clear(CloseShortLimitPrices)     // Remove all CloseShort orders
+    cancelShortSide := true                // Mark that we need to send the alert
+
+// Check if there is an active StopLoss AND it's above the upperBand AND trend turned bullish
+if not na(ShortStopLossLimitPrice) and trendTurnedUp and ShortStopLossLimitPrice >= upperBand
+    canceledStopShortPrice := ShortStopLossLimitPrice
+    ShortStopLossLimitPrice := na
+    cancelShortSide := true
+var float StopLongExecPrice = na
+if time >= testPeriodStart and LongPositionSize > 0 and not na(LongStopLossLimitPrice) and not LongStopLossActivated
+
+    // --- CONDITION 1: Price wicked through StopLoss level ---
+    bool StopCrossLong = low <= LongStopLossLimitPrice and open >= LongStopLossLimitPrice
+
+    // --- CONDITION 2: Candle opened clearly below StopLoss (gap-down) ---
+    bool StopGapLong = open < LongStopLossLimitPrice
+
+    // --- FINAL TRIGGER ---
+    bool TriggerStopLossLong = StopCrossLong or StopGapLong
+
+    if TriggerStopLossLong
+
+        // Activate stop-loss flag for this side
+        LongStopLossActivated := true
+        barIndexStopLossLong := bar_index
+
+        // Set the execution price
+        float StopLossExecutionPrice = StopGapLong ? open : LongStopLossLimitPrice
+
+        // Cancel all pending Long grid levels
+        array.clear(LongLimitPrices)
+        array.clear(CloseLongLimitPrices)
+
+        // Define the position to close (100%)
+        float CloseLongQty = LongPositionSize
+
+        // Calculate PnL and commission
+        float pnl = (StopLossExecutionPrice - AvgLongPrice) * CloseLongQty
+        float commission = CloseLongQty * StopLossExecutionPrice * TakerFee
+
+        // Apply net PnL to balance (PnL - fee) ===
+        BalanceReal := BalanceReal + pnl
+
+        // Register fee separately ===
+        Commission += commission
+        Losses += commission
+
+        // Allocate gross PnL and register outcome ===
+        if pnl > 0
+            Gains += pnl
+            nWins += 1
+        else if pnl < 0
+            Losses += math.abs(pnl)
+            nLosses += 1
+
+        // Recalculate full accounting state
+        fFullAccountingUpdate(BalanceReal)
+
+        // Visual label on the chart to mark stop
+        label.new(
+             bar_index,
+             StopLossExecutionPrice,
+             "Stop 100%",
+             style = label.style_label_left,
+             color = color.new(color.purple, 45),
+             textcolor = color.new(color.white, 10),
+             size = fTextSize(LabelSizeInput),
+             yloc = yloc.price
+         )
+
+        // Store last executed StopLoss price for reference
+        StopLongExecPrice := StopLossExecutionPrice
+
+        // Reset Long state variables
+        LongPositionSize := 0
+        LongPositionCash := 0.0
+        nLongs := 0
+        nCloseLongs := 0
+        initialLongPositionSize := 0.0
+        LongStopLossLimitPrice := na
+        AvgLongPrice := na
+
+        // Clear historical grid price arrays
+        array.clear(LongPrices)
+        array.clear(CloseLongPrices)
+
+        // If Short side is inactive, reset its StopLoss flags
+        if ShortPositionSize == 0
+            ShortStopLossActivated := false
+            ShortStopLossLimitPrice := na
+
+        // ==========================================================
+        // ALERT CALL – STOP LOSS LONG (FORCED MARKET EXIT)
+        // ==========================================================
+        fAlertStopLossLong(0)
+var float StopShortExecPrice = na
+if time >= testPeriodStart and ShortPositionSize > 0 and not na(ShortStopLossLimitPrice) and not ShortStopLossActivated
+
+    // --- CONDITION 1: Price wicked through StopLoss level ---
+    bool StopCrossShort = high >= ShortStopLossLimitPrice and open <= ShortStopLossLimitPrice
+
+    // --- CONDITION 2: Candle opened clearly above StopLoss (gap-up) ---
+    bool StopGapShort = open > ShortStopLossLimitPrice
+
+    // --- FINAL TRIGGER ---
+    bool TriggerStopLossShort = StopCrossShort or StopGapShort
+
+    if TriggerStopLossShort
+
+        // Activate stop-loss flag for this side
+        ShortStopLossActivated := true
+        barIndexStopLossShort := bar_index
+
+        // Set the execution price
+        float StopLossExecutionPrice = StopGapShort ? open : ShortStopLossLimitPrice
+
+        // Cancel all pending Short grid levels
+        array.clear(ShortLimitPrices)
+        array.clear(CloseShortLimitPrices)
+
+        // Define the position to close (100%)
+        float CloseShortQty = ShortPositionSize
+
+        // Calculate PnL and commission
+        float pnl = (AvgShortPrice - StopLossExecutionPrice) * CloseShortQty
+        float commission = CloseShortQty * StopLossExecutionPrice * TakerFee
+
+        // Apply net PnL to account balance ===
+        BalanceReal := BalanceReal + pnl - commission
+
+        // Register fee separately ===
+        Commission += commission
+        Losses += commission
+
+        // Allocate gross PnL and update win/loss counters ===
+        if pnl > 0
+            Gains += pnl
+            nWins += 1
+        else if pnl < 0
+            Losses += math.abs(pnl)
+            nLosses += 1
+
+        // Recalculate full accounting state
+        fFullAccountingUpdate(BalanceReal)
+
+        // Visual label on the chart to mark stop
+        label.new(
+             bar_index,
+             StopLossExecutionPrice,
+             "Stop 100%",
+             style = label.style_label_left,
+             color = color.new(color.purple, 45),
+             textcolor = color.new(color.white, 10),
+             size = fTextSize(LabelSizeInput),
+             yloc = yloc.price
+         )
+
+        // Store last executed StopLoss price for reference
+        StopShortExecPrice := StopLossExecutionPrice
+
+        // Reset Short state variables
+        ShortPositionSize := 0
+        ShortPositionCash := 0.0
+        nShorts := 0
+        nCloseShorts := 0
+        initialShortPositionSize := 0.0
+        ShortStopLossLimitPrice := na
+        AvgShortPrice := na
+
+        // Clear historical grid price arrays
+        array.clear(ShortPrices)
+        array.clear(CloseShortPrices)
+
+        // If Long side is inactive, reset its StopLoss flags
+        if LongPositionSize == 0
+            LongStopLossActivated := false
+            LongStopLossLimitPrice := na
+
+        // ==========================================================
+        // ALERT CALL – STOP LOSS SHORT (FORCED MARKET EXIT)
+        // ==========================================================
+        fAlertStopLossShort(0)
+if array.size(LongLimitPrices) > 0 and trendTurnedDown
+    // Get the first pending Long entry price (oldest one) de forma temporal
+    tempLongPrice = array.get(LongLimitPrices, 0)
+    
+    // Only cancel if the order is below or equal to the bearish SuperTrend band
+    if tempLongPrice <= lowerBand
+        canceledLongPrice := tempLongPrice
+        array.clear(LongLimitPrices)
+        cancelLongSide := true
+
+// Check if there are pending CloseLong orders AND the trend turned bearish
+if array.size(CloseLongLimitPrices) > 0 and trendTurnedDown
+    // Get the first CloseLong level
+    canceledCloseLongPrice := array.get(CloseLongLimitPrices, 0)
+    array.clear(CloseLongLimitPrices)      // Remove all CloseLong orders
+    cancelLongSide := true                 // Mark that we need to send the alert
+
+// Check if there is an active StopLoss AND it’s below the lowerBand AND trend turned bearish
+if not na(LongStopLossLimitPrice) and trendTurnedDown and LongStopLossLimitPrice <= lowerBand
+    canceledStopLongPrice := LongStopLossLimitPrice
+    LongStopLossLimitPrice := na
+    cancelLongSide := true
+
+// If any Long-related order was canceled, trigger a single cancel alert
+if cancelLongSide
+    fAlertLongExit(0)
+if array.size(ShortLimitPrices) > 0 and trendTurnedUp
+    // Get the first pending Short entry price (oldest one) only temporarily
+    tempShortPrice = array.get(ShortLimitPrices, 0)
+    
+    // Only cancel if the order is above or equal to the bullish SuperTrend band
+    if tempShortPrice >= upperBand
+        canceledShortPrice := tempShortPrice       // Assign only if truly cancelled
+        array.clear(ShortLimitPrices)              // Remove all Short entry orders
+        cancelShortSide := true                    // Mark that we need to send the alert
+
+// Check if there are pending CloseShort orders AND the trend turned bullish
+if array.size(CloseShortLimitPrices) > 0 and trendTurnedUp
+    // Get the first CloseShort level
+    canceledCloseShortPrice := array.get(CloseShortLimitPrices, 0)
+    array.clear(CloseShortLimitPrices)     // Remove all CloseShort orders
+    cancelShortSide := true                // Mark that we need to send the alert
+
+// Check if there is an active StopLoss AND it's above the upperBand AND trend turned bullish
+if not na(ShortStopLossLimitPrice) and trendTurnedUp and ShortStopLossLimitPrice >= upperBand
+    canceledStopShortPrice := ShortStopLossLimitPrice
+    ShortStopLossLimitPrice := na
+    cancelShortSide := true
+
+// If any Short-related order was canceled, trigger a single cancel alert
+if cancelShortSide
+    fAlertShortExit(0)
+
+// === Plot visual cross for canceled Long entries
+var color _cancelLongColor = color.aqua
+var string _cancelLongShapeStyle = shape.xcross
+_canceledLong = not na(canceledLongPrice) ? canceledLongPrice : na
+
+plotshape(_canceledLong, title = "Canceled Long Core",      style = _cancelLongShapeStyle, location = location.absolute, color = color.new(_cancelLongColor, 45),  size = size.tiny,   display = display.all - display.status_line)
+plotshape(_canceledLong, title = "Canceled Long Glow Mid",  style = _cancelLongShapeStyle, location = location.absolute, color = color.new(_cancelLongColor, 65),  size = size.small,  display = display.all - display.status_line)
+plotshape(_canceledLong, title = "Canceled Long Glow Out",  style = _cancelLongShapeStyle, location = location.absolute, color = color.new(_cancelLongColor, 80),  size = size.normal, display = display.all - display.status_line)
+canceledLongPrice := na
+
+// === Plot visual cross for canceled CloseLongs
+var color _cancelCloseLongColor = color.orange
+var string _cancelCloseLongShapeStyle = shape.xcross
+_canceledCloseLong = not na(canceledCloseLongPrice) ? canceledCloseLongPrice : na
+
+plotshape(_canceledCloseLong, title = "Canceled CloseLong Core",      style = _cancelCloseLongShapeStyle, location = location.absolute, color = color.new(_cancelCloseLongColor, 45),  size = size.tiny,   display = display.all - display.status_line)
+plotshape(_canceledCloseLong, title = "Canceled CloseLong Glow Mid",  style = _cancelCloseLongShapeStyle, location = location.absolute, color = color.new(_cancelCloseLongColor, 65),  size = size.small,  display = display.all - display.status_line)
+plotshape(_canceledCloseLong, title = "Canceled CloseLong Glow Out",  style = _cancelCloseLongShapeStyle, location = location.absolute, color = color.new(_cancelCloseLongColor, 80),  size = size.normal, display = display.all - display.status_line)
+canceledCloseLongPrice := na
+
+// === Plot visual cross for canceled Long StopLoss
+var color _cancelStopLongColor = color.fuchsia
+var string _cancelStopLongShapeStyle = shape.xcross
+_canceledStopLong = not na(canceledStopLongPrice) ? canceledStopLongPrice : na
+
+plotshape(_canceledStopLong, title = "Canceled StopLong Core",      style = _cancelStopLongShapeStyle, location = location.absolute, color = color.new(_cancelStopLongColor, 45),  size = size.tiny,   display = display.all - display.status_line)
+plotshape(_canceledStopLong, title = "Canceled StopLong Glow Mid",  style = _cancelStopLongShapeStyle, location = location.absolute, color = color.new(_cancelStopLongColor, 65),  size = size.small,  display = display.all - display.status_line)
+plotshape(_canceledStopLong, title = "Canceled StopLong Glow Out",  style = _cancelStopLongShapeStyle, location = location.absolute, color = color.new(_cancelStopLongColor, 80),  size = size.normal, display = display.all - display.status_line)
+canceledStopLongPrice := na
+
+// === Plot visual cross for canceled Short entries
+var color _cancelShortColor = color.red
+var string _cancelShortShapeStyle = shape.xcross
+_canceledShort = not na(canceledShortPrice) ? canceledShortPrice : na
+plotshape(_canceledShort, title = "Canceled Short Core",      style = _cancelShortShapeStyle, location = location.absolute, color = color.new(_cancelShortColor, 45),  size = size.tiny,   display = display.all - display.status_line)
+plotshape(_canceledShort, title = "Canceled Short Glow Mid",  style = _cancelShortShapeStyle, location = location.absolute, color = color.new(_cancelShortColor, 65),  size = size.small,  display = display.all - display.status_line)
+plotshape(_canceledShort, title = "Canceled Short Glow Out",  style = _cancelShortShapeStyle, location = location.absolute, color = color.new(_cancelShortColor, 80),  size = size.normal, display = display.all - display.status_line)
+canceledShortPrice := na
+
+// === Plot visual cross for canceled CloseShorts
+var color _cancelCloseShortColor = color.green
+var string _cancelCloseShortShapeStyle = shape.xcross
+_canceledCloseShort = not na(canceledCloseShortPrice) ? canceledCloseShortPrice : na
+
+plotshape(_canceledCloseShort, title = "Canceled CloseShort Core",      style = _cancelCloseShortShapeStyle, location = location.absolute, color = color.new(_cancelCloseShortColor, 45),  size = size.tiny,   display = display.all - display.status_line)
+plotshape(_canceledCloseShort, title = "Canceled CloseShort Glow Mid",  style = _cancelCloseShortShapeStyle, location = location.absolute, color = color.new(_cancelCloseShortColor, 65),  size = size.small,  display = display.all - display.status_line)
+plotshape(_canceledCloseShort, title = "Canceled CloseShort Glow Out",  style = _cancelCloseShortShapeStyle, location = location.absolute, color = color.new(_cancelCloseShortColor, 80),  size = size.normal, display = display.all - display.status_line)
+canceledCloseShortPrice := na
+
+// === Plot visual cross for canceled StopLossShort
+var color _cancelStopShortColor = color.fuchsia
+var string _cancelStopShortShapeStyle = shape.xcross
+_canceledStopShort = not na(canceledStopShortPrice) ? canceledStopShortPrice : na
+
+plotshape(_canceledStopShort, title = "Canceled StopShort Core",      style = _cancelStopShortShapeStyle, location = location.absolute, color = color.new(_cancelStopShortColor, 45),  size = size.tiny,   display = display.all - display.status_line)
+plotshape(_canceledStopShort, title = "Canceled StopShort Glow Mid",  style = _cancelStopShortShapeStyle, location = location.absolute, color = color.new(_cancelStopShortColor, 65),  size = size.small,  display = display.all - display.status_line)
+plotshape(_canceledStopShort, title = "Canceled StopShort Glow Out",  style = _cancelStopShortShapeStyle, location = location.absolute, color = color.new(_cancelStopShortColor, 80),  size = size.normal, display = display.all - display.status_line)
+canceledStopShortPrice := na
+int interval = switch timeframe.period
+    "1"     => 1
+    "3"     => 3
+    "5"     => 5
+    "15"    => 15
+    "30"    => 30
+    "45"    => 45
+    "60"    => 60
+    "120"   => 120
+    "240"   => 240
+    "360"   => 360
+    "480"   => 480
+    "720"   => 720
+    "D"     => 1440
+    "W"     => 10080
+    "M"     => 43200
+    => 1  // fallback
+
+// === FUNDING FEE PER BAR: Scaled from 8H rate ===
+fundingRatePerBar = FundingFeeRate8H * (interval / 480.0)
+
+// === COMPUTE FUNDING FEES FOR ACTIVE POSITIONS ===
+fundingFeeLong  = LongPositionSize > 0 ? LongPositionSize * close * fundingRatePerBar : 0.0
+fundingFeeShort = ShortPositionSize > 0 ? ShortPositionSize * close * fundingRatePerBar : 0.0
+
+// === APPLY TO BALANCE AND ACCOUNTING ===
+totalFunding = fundingFeeLong + fundingFeeShort
+BalanceReal := BalanceReal - totalFunding
+Commission  += totalFunding
+Losses      += totalFunding
+
+// === FINAL ACCOUNTING UPDATE – Recalculate Real Balance ===
+BalanceReal := InitialCapital + Gains - Losses +
+     (LongPositionSize > 0 ? (close - AvgLongPrice) * LongPositionSize : 0) +
+     (ShortPositionSize > 0 ? (AvgShortPrice - close) * ShortPositionSize : 0)
+
+fFullAccountingUpdate(BalanceReal)
+BalanceReal := InitialCapital
+             + Gains
+             - Losses
+             + (LongPositionSize  > 0 and not na(AvgLongPrice)  ? (close - AvgLongPrice)  * LongPositionSize  : 0)
+             + (ShortPositionSize > 0 and not na(AvgShortPrice) ? (AvgShortPrice - close) * ShortPositionSize : 0)
+
+fFullAccountingUpdate(BalanceReal)
+var label[] longLabels = array.new<label>()
+var label[] closeLongLabels = array.new<label>()
+var label[] stopLongLabels = array.new<label>()
+var label[] shortLabels = array.new<label>()
+var label[] closeShortLabels = array.new<label>()
+var label[] stopShortLabels = array.new<label>()
+
+// Cleanup function to delete all labels in a given array (safe check)
+fClearLabels(labelArray) =>
+    if array.size(labelArray) > 0
+        for i = 0 to array.size(labelArray) - 1
+            l = array.get(labelArray, i)
+            if not na(l)
+                label.delete(l)
+        array.clear(labelArray)
+
+// ==========================================================
+// FLOATING PRICE LABELS – Real-time markers with dynamic % (NASA Level)
+// ==========================================================
+
+if barstate.isrealtime
+
+    // 🧹 Clear all previous labels from chart to avoid clutter
+    fClearLabels(longLabels)
+    fClearLabels(closeLongLabels)
+    fClearLabels(stopLongLabels)
+    fClearLabels(shortLabels)
+    fClearLabels(closeShortLabels)
+    fClearLabels(stopShortLabels)
+
+    // ==========================================================
+    // DRAW PENDING LONG LIMIT LABELS
+    // ==========================================================
+    if array.size(LongLimitPrices) > 0 and BalanceReal > 0
+        for i = 0 to array.size(LongLimitPrices) - 1
+            _longPrice = array.get(LongLimitPrices, i)
+            if not na(_longPrice)
+                // Get Long qty and % allocation for this grid level
+                [_qty, _pct] = fGridEntrySizeAndPercent("long", MaxEntries)
+                // Create and display label
+                lbl = label.new(bar_index + 1, _longPrice,
+                     "🟦 Long\n@ " + str.tostring(_longPrice, '#.##') + "\n" +
+                     str.tostring(_pct, '#.##') + "% Cash",
+                     style=label.style_label_left,
+                     color=color.new(color.aqua, 60),
+                     textcolor=color.new(color.white, 10),
+                     size=fTextSize(LabelSizeInput))
+                array.push(longLabels, lbl)
+
+    // ==========================================================
+    // DRAW PENDING CLOSE LONG LIMIT LABELS
+    // ==========================================================
+    if array.size(CloseLongLimitPrices) > 0 and LongPositionSize > 0
+        for i = 0 to array.size(CloseLongLimitPrices) - 1
+            _closePrice = array.get(CloseLongLimitPrices, i)
+            if not na(_closePrice)
+                // Get CloseLong qty and % of total position
+                [_qtyClose, _pctClose] = fGridCloseSizeAndPercent("long", nCloseLongs + i)
+                // Create and display label
+                lbl = label.new(bar_index + 1, _closePrice,
+                     "🟧 Close\n@ " + str.tostring(_closePrice, '#.##') + "\n" +
+                     str.tostring(_pctClose, '#.##') + "% Position",
+                     style=label.style_label_left,
+                     color=color.new(color.orange, 60),
+                     textcolor=color.new(color.white, 10),
+                     size=fTextSize(LabelSizeInput))
+                array.push(closeLongLabels, lbl)
+
+    // ==========================================================
+    // DRAW LONG STOP LOSS LABEL
+    // ==========================================================
+    // Proceed only if a Long position is open, a StopLoss is active, and there are Long limit orders to compare
+    if not na(LongStopLossLimitPrice) and LongPositionSize > 0 and array.size(LongLimitPrices) > 0    
+        // Initialize flag to detect if the StopLoss overlaps any pending Long entry
+        bool stopTooCloseToLong = false
+        // Iterate through all active Long limit prices
+        for i = 0 to array.size(LongLimitPrices) - 1
+            // Retrieve the price of the current Long limit level
+            _longPrice = array.get(LongLimitPrices, i)
+            // Continue only if the price is valid (not `na`)
+            if not na(_longPrice)
+                // Calculate the percentage distance between StopLoss and this Long level
+                float dist = math.abs(LongStopLossLimitPrice - _longPrice) / _longPrice
+                // If the distance is less than or equal to 0.2%, mark it as overlapping
+                if dist <= 0.0025
+                    stopTooCloseToLong := true
+
+        // If there's no overlap with any Long limit, draw the StopLoss label
+        if not stopTooCloseToLong
+            // Create the visual StopLoss label on the chart
+            label lbl = label.new(
+                 bar_index + 1,
+                 LongStopLossLimitPrice,
+                 "🟪 Stop\n@ " + str.tostring(LongStopLossLimitPrice, '#.##'),
+                 style=label.style_label_left,
+                 color=color.new(color.fuchsia, 60),
+                 textcolor=color.new(color.white, 10),
+                 size=fTextSize(LabelSizeInput))
+            // Store the label in the array so it can be removed later (next real-time cycle)
+            array.push(stopLongLabels, lbl)
+
+    // ==========================================================
+    // DRAW PENDING SHORT LIMIT LABELS
+    // ==========================================================
+    if array.size(ShortLimitPrices) > 0 and BalanceReal > 0
+        for i = 0 to array.size(ShortLimitPrices) - 1
+            _shortPrice = array.get(ShortLimitPrices, i)
+            if not na(_shortPrice)
+                // Get Short qty and % allocation for this grid level
+                [_qty, _pct] = fGridEntrySizeAndPercent("short", MaxEntries)
+                // Create and display label
+                lbl = label.new(bar_index + 1, _shortPrice,
+                     "🟥 Short\n@ " + str.tostring(_shortPrice, '#.##') + "\n" +
+                     str.tostring(_pct, '#.##') + "% Cash",
+                     style=label.style_label_left,
+                     color=color.new(color.red, 60),
+                     textcolor=color.new(color.white, 10),
+                     size=fTextSize(LabelSizeInput))
+                array.push(shortLabels, lbl)
+
+    // ==========================================================
+    // DRAW PENDING CLOSE SHORT LIMIT LABELS
+    // ==========================================================
+    if array.size(CloseShortLimitPrices) > 0 and ShortPositionSize > 0
+        for i = 0 to array.size(CloseShortLimitPrices) - 1
+            _closePrice = array.get(CloseShortLimitPrices, i)
+            if not na(_closePrice)
+                // Get CloseShort qty and % of total position
+                [_qtyClose, _pctClose] = fGridCloseSizeAndPercent("short", nCloseShorts + i)
+                // Create and display label
+                lbl = label.new(bar_index + 1, _closePrice,
+                     "🟩 Close\n@ " + str.tostring(_closePrice, '#.##') + "\n" +
+                     str.tostring(_pctClose, '#.##') + "% Position",
+                     style=label.style_label_left,
+                     color=color.new(color.green, 60),
+                     textcolor=color.new(color.white, 10),
+                     size=fTextSize(LabelSizeInput))
+                array.push(closeShortLabels, lbl)
+
+    // ==========================================================
+    // DRAW SHORT STOP LOSS LABEL
+    // ==========================================================
+    // Proceed only if a Short position is open, a StopLoss is active, and there are Short limit orders to compare
+    if not na(ShortStopLossLimitPrice) and ShortPositionSize > 0 and array.size(ShortLimitPrices) > 0
+        // Initialize flag to detect if the StopLoss overlaps any pending Short entry
+        bool stopTooCloseToShort = false
+        // Iterate through all active Short limit prices
+        for i = 0 to array.size(ShortLimitPrices) - 1
+            // Retrieve the price of the current Short limit level
+            _shortPrice = array.get(ShortLimitPrices, i)
+            // Continue only if the price is valid (not `na`)
+            if not na(_shortPrice)
+                // Calculate the percentage distance between StopLoss and this Short level
+                float dist = math.abs(ShortStopLossLimitPrice - _shortPrice) / _shortPrice
+                // If the distance is less than or equal to 0.2%, mark it as overlapping
+                if dist <= 0.0025
+                    stopTooCloseToShort := true
+
+        // If there's no overlap with any Short limit, draw the StopLoss label
+        if not stopTooCloseToShort
+            // Create the visual StopLoss label on the chart
+            label lbl = label.new(
+                 bar_index + 1,
+                 ShortStopLossLimitPrice,
+                 "🟪 Stop\n@ " + str.tostring(ShortStopLossLimitPrice, '#.##'),
+                 style=label.style_label_left,
+                 color=color.new(color.fuchsia, 60),
+                 textcolor=color.new(color.white, 10),
+                 size=fTextSize(LabelSizeInput))
+            // Store the label in the array so it can be removed later (next real-time cycle)
+            array.push(stopShortLabels, lbl)
+changeAvgPriceLong = ta.change(AvgLongPrice)
+
+// Detect average price change (Short side)
+changeAvgPriceShort = ta.change(AvgShortPrice)
+
+// Plot Long average price when change is detected (real-time)
+plotshape(
+     barstate.isrealtime and changeAvgPriceLong != 0 ? AvgLongPrice : na,
+     title = "AvgLongPrice Real-Time",
+     style = shape.diamond,
+     location = location.absolute,
+     color = color.new(color.aqua, 10),
+     size = size.tiny
+ )
+
+// Plot Long average price historical change without array cross-check
+plotshape(
+     not barstate.isrealtime and changeAvgPriceLong != 0 ? AvgLongPrice : na,
+     title = "AvgLongPrice Historical",
+     style = shape.diamond,
+     location = location.absolute,
+     color = color.new(color.aqua, 45),
+     size = size.tiny
+ )
+
+// Plot Short average price when change is detected (real-time)
+plotshape(
+     barstate.isrealtime and changeAvgPriceShort != 0 ? AvgShortPrice : na,
+     title = "AvgShortPrice Real-Time",
+     style = shape.diamond,
+     location = location.absolute,
+     color = color.new(color.red, 10),
+     size = size.tiny
+ )
+
+// Plot Short average price historical change without array cross-check
+plotshape(
+     not barstate.isrealtime and changeAvgPriceShort != 0 ? AvgShortPrice : na,
+     title = "AvgShortPrice Historical",
+     style = shape.diamond,
+     location = location.absolute,
+     color = color.new(color.red, 45),
+     size = size.tiny
+ )
+var float pendingLongPrice = na
+var float pendingCloseLongPrice = na
+var float pendingStopLongPrice = na
+
+// Pick first available Long price
+pendingLongPrice := array.size(LongLimitPrices) > 0 ? array.get(LongLimitPrices, 0) : na
+
+// Pick first available Close price
+pendingCloseLongPrice := array.size(CloseLongLimitPrices) > 0 ? array.get(CloseLongLimitPrices, 0) : na
+
+// Determine if Stop overlaps any Longs
+var bool stopOverlapsLong = false
+stopOverlapsLong := false
+if not na(LongStopLossLimitPrice) and array.size(LongLimitPrices) > 0
+    for i = 0 to array.size(LongLimitPrices) - 1
+        _pendingLong = array.get(LongLimitPrices, i)
+        if not na(_pendingLong) and math.abs(LongStopLossLimitPrice - _pendingLong) <= _pendingLong * 0.0001
+            stopOverlapsLong := true
+
+// Assign Stop price if no overlap
+pendingStopLongPrice := (not stopOverlapsLong and not na(LongStopLossLimitPrice)) ? LongStopLossLimitPrice : na
+
+// Now plot OUTSIDE any loop or condition
+
+// PLOT FIRST PENDING LONG LEVEL – Horizontal Line Visualization
+
+plot(
+     not na(pendingLongPrice) ? pendingLongPrice : na,       
+     title = 'Long Level',
+     color = color.new(color.aqua, 25),                     
+     linewidth = 1,                                          
+     style = plot.style_circles
+ )
+
+// PLOT FIRST PENDING CLOSE LEVEL – Horizontal Line Visualization
+
+plot(
+     not na(pendingCloseLongPrice) ? pendingCloseLongPrice : na, 
+     title = 'Close Level',
+     color = color.new(color.orange, 25),                       
+     linewidth = 1,                                              
+     style = plot.style_circles
+ )
+
+// PLOT PENDING STOP LOSS LEVEL – Only if it doesn't overlap Long level
+
+plot(
+     not na(pendingStopLongPrice) ? pendingStopLongPrice : na,   
+     title = 'Stop Level',
+     color = color.new(color.purple, 25),                       
+     linewidth = 1,                                              
+     style = plot.style_circles
+ )
+var float pendingShortPrice = na
+var float pendingCloseShortPrice = na
+var float pendingStopShortPrice = na
+
+// Retrieve first available short price
+pendingShortPrice := array.size(ShortLimitPrices) > 0 ? array.get(ShortLimitPrices, 0) : na
+
+// Retrieve first available close price
+pendingCloseShortPrice := array.size(CloseShortLimitPrices) > 0 ? array.get(CloseShortLimitPrices, 0) : na
+
+// Check if stop overlaps any short levels
+var bool stopOverlapsShort = false
+stopOverlapsShort := false
+if not na(ShortStopLossLimitPrice) and array.size(ShortLimitPrices) > 0
+    for i = 0 to array.size(ShortLimitPrices) - 1
+        _pendingShort = array.get(ShortLimitPrices, i)
+        if not na(_pendingShort) and math.abs(ShortStopLossLimitPrice - _pendingShort) <= _pendingShort * 0.0001
+            stopOverlapsShort := true
+
+// Assign stop price only if no overlap detected
+pendingStopShortPrice := (not stopOverlapsShort and not na(ShortStopLossLimitPrice)) ? ShortStopLossLimitPrice : na
+
+// PLOT FIRST PENDING SHORT LEVEL – Horizontal Line Visualization
+
+plot(
+     not na(pendingShortPrice) ? pendingShortPrice : na,      
+     title = 'Short Level',
+     color = color.new(color.red, 25),                       
+     linewidth = 1,                                           
+     style = plot.style_circles
+ )
+
+// PLOT FIRST PENDING CLOSE SHORT LEVEL – Horizontal Line Visualization
+
+plot(
+     not na(pendingCloseShortPrice) ? pendingCloseShortPrice : na, 
+     title = 'Close Short Level',
+     color = color.new(color.green, 25),                          
+     linewidth = 1,                                                
+     style = plot.style_circles
+ )
+
+
+// PLOT PENDING STOP SHORT LEVEL – Horizontal Line Visualization
+
+plot(
+     not na(pendingStopShortPrice) ? pendingStopShortPrice : na,   
+     title = 'Stop Short Level',
+     color = color.new(color.fuchsia, 25),                        
+     linewidth = 1,                                                
+     style = plot.style_circles
+ )
+bool liquidationOccurred = liquidationOccurredLong or liquidationOccurredShort
+
+// Get the type of asset currently loaded on the chart
+// Used to adapt panel labels (e.g., crypto, stock, forex)
+string assetType = syminfo.type
+
+// Format numbers with thousands separator and fixed decimal places
+fFormatNumber(_num, _decimals) =>
+    str.tostring(_num, "#,##0." + str.repeat("0", _decimals))
+
+// Convert milliseconds to a smart string like "1M 5D 3H"
+tfString(int timeInMs) =>
+    int totalMin  = timeInMs / 1000 / 60
+    int totalHr   = totalMin / 60
+    int totalDays = totalHr / 24
+    float daysPerYear  = 365.25
+    float daysPerMonth = 30.44
+    int y  = int(totalDays / daysPerYear)
+    float remDaysAfterYear = totalDays % daysPerYear
+    int m  = int(remDaysAfterYear / daysPerMonth)
+    float remDaysAfterMonth = remDaysAfterYear % daysPerMonth
+    int dd = int(remDaysAfterMonth)
+    int hh = totalHr % 24
+    int mm = totalMin % 60
+    string yearStr   = y  > 0 ? fFormatNumber(y, 0)  + "Y "  : ""
+    string monthStr  = m  > 0 ? fFormatNumber(m, 0)  + "M "  : ""
+    string dayStr    = dd > 0 ? fFormatNumber(dd, 0) + "D "  : ""
+    string hourStr   = (y + m + dd == 0 and hh > 0) ? fFormatNumber(hh, 0) + "H " : ""
+    string minuteStr = (y + m + dd + hh == 0) ? fFormatNumber(mm, 0) + "min" : ""
+    yearStr + monthStr + dayStr + hourStr + minuteStr
+
+// Set the hold label depending on the trade mode selected
+string holdLabel = TradeMode == "Long"  ? " Long & Hold:" :
+                   TradeMode == "Short" ? " Short & Hold:" : " Best Hold:"
+
+// Function to determine cell colors based on metric values
+fGetPanelColors() =>
+    // Color for liquidation status (dynamic based on proximity to liq. price)
+    color liqColor = liquidationOccurred ? color.new(color.red, 65) : (not na(LiquidationPrice) and close <= LiquidationPrice * 1.05 ? color.new(color.orange, 65) : color.new(color.green, 65))
+
+    array.from(
+         color.new(color.gray, 65),  // Asset type
+         liquidationOccurred ? color.new(color.red, 65) : color.new(color.green, 65),  // Equity
+         color.new(color.green, 65),  // Available cash
+         color.new(color.blue, 65),   // Margin used
+         array.get(accountingArray, 7) >= 0 ? color.new(color.green, 65) : color.new(color.red, 65),  // Net profit %
+         array.get(accountingArray, 27) >= 0 ? color.new(color.green, 65) : color.new(color.red, 65),  // Net profit no fees
+         array.get(accountingArray, 26) >= 0 ? color.new(color.green, 65) : color.new(color.red, 65),  // Floating PnL % (over position)
+         array.get(accountingArray, 22) >= 0 ? color.new(color.green, 65) : color.new(color.red, 65),  // ROI %
+         color.new(color.blue, 65),  // Long pos size
+         color.new(color.blue, 65),  // Avg long price
+         color.new(color.blue, 65),  // Short pos size
+         color.new(color.blue, 65),  // Avg short price
+         color.new(color.yellow, 65),  // Leverage
+         liqColor,  // Liquidation
+         array.get(accountingArray, 1) >= 0 ? color.new(color.green, 65) : color.new(color.red, 65),  // Passive return
+         array.get(accountingArray, 17) >= 1 ? color.new(color.green, 65) : color.new(color.red, 65),  // Hold efficiency
+         array.get(accountingArray, 15) >= 1 ? color.new(color.green, 65) : color.new(color.red, 65),  // Profit factor
+         array.get(accountingArray, 24) >= 1.0 ? color.new(color.green, 65) : color.new(color.red, 65),  // Payoff ratio
+         array.get(accountingArray, 16) >= 50 ? color.new(color.green, 65) : color.new(color.red, 65),  // Win rate
+         array.get(accountingArray, 23) >= 0 ? color.new(color.green, 65) : color.new(color.red, 65),   // Expectancy %R
+         array.get(accountingArray, 19) >= 10 ? color.new(color.red, 65) : color.new(color.green, 65),  // Max drawdown
+         color.new(color.orange, 65),  // Commission paid
+         color.new(color.green, 65),   // Long trades
+         color.new(color.red, 65),     // Short trades
+         color.new(color.white, 65),   // Time trading
+         array.get(accountingArray, 25) >= 5000000 ? color.new(color.green, 65) : color.new(color.orange, 65),  // Monthly volume
+         color.new(color.gray, 65)     // Min capital required
+     )
+
+// Function to determine panel values dynamically
+fGetPanelValues() =>
+    // Build descriptive strings for trade counts and leverage
+    string LongTradeStr  = str.tostring(TotalLongsExecuted) + " Entries / " + str.tostring(TotalClosesExecuted) + " Closes"  // Long trade summary
+    string ShortTradeStr = str.tostring(TotalShortsExecuted) + " Entries / " + str.tostring(TotalShortClosesExecuted) + " Closes"  // Short trade summary
+    string leverageStr = LeverageMultiplier > 1 ? fFormatNumber(LongPositionSize > 0 ? CLeverageLong : ShortPositionSize > 0 ? CLeverageShort : 0.0, 2) + 'x' : 'Spot'  // Current leverage
+    string liqStr = (LeverageMultiplier <= 1 or na(LiquidationPrice) or LiquidationPrice <= 0)
+         ? 'No Margin'
+         : fFormatNumber(LiquidationPrice, 2) + ' ' + syminfo.currency  // Liquidation price string
+    string holdEfficiencyValue = not na(array.get(accountingArray, 17)) ? fFormatNumber(array.get(accountingArray, 17), 2) : '-'  // Efficiency vs passive
+
+    array.from(
+         str.upper(assetType),  // Asset type
+         liquidationOccurred or array.get(accountingArray, 12) <= 0
+             ? '‼️ LIQUIDATED ‼️'
+             : fFormatNumber(array.get(accountingArray, 12), 2) + ' ' + syminfo.currency,  // Net equity
+         not na(array.get(accountingArray, 14)) ? fFormatNumber(array.get(accountingArray, 14), 2) + ' ' + syminfo.currency : "-",  // Available cash
+         not na(array.get(accountingArray, 13)) ? fFormatNumber(array.get(accountingArray, 13), 2) + ' ' + syminfo.currency : "-",  // Margin used
+         not na(array.get(accountingArray, 7))  ? fFormatNumber(array.get(accountingArray, 7), 2) + " %" : "-",  // Net profit %
+         not na(array.get(accountingArray, 27)) ? fFormatNumber(array.get(accountingArray, 27), 2) + " %" : "-",  // Net profit before fees %
+         not na(array.get(accountingArray, 26)) ? fFormatNumber(array.get(accountingArray, 26), 2) + " %" : "-",  // Floating PnL % over position
+         not na(array.get(accountingArray, 22)) ? fFormatNumber(array.get(accountingArray, 22), 2) + " %" : "-",  // ROI %
+         (not na(AvgLongPrice) and LongPositionSize > 0) ? fFormatNumber(LongPositionSize, 4) + ' ' + syminfo.basecurrency : "-",  // Long size
+         (not na(AvgLongPrice) and LongPositionSize > 0) ? fFormatNumber(AvgLongPrice, 2) : "-",  // Avg long price
+         (not na(AvgShortPrice) and ShortPositionSize > 0) ? fFormatNumber(ShortPositionSize, 4) + ' ' + syminfo.basecurrency : "-",  // Short size
+         (not na(AvgShortPrice) and ShortPositionSize > 0) ? fFormatNumber(AvgShortPrice, 2) : "-",  // Avg short price
+         leverageStr,  // Leverage
+         liqStr,       // Liquidation
+         not na(array.get(accountingArray, 1))  ? fFormatNumber(array.get(accountingArray, 1), 2) + ' %' : "-",  // Passive return
+         holdEfficiencyValue,  // Hold efficiency (already safe)
+         not na(array.get(accountingArray, 15)) ? fFormatNumber(array.get(accountingArray, 15), 2) : "-",  // Profit factor
+         not na(array.get(accountingArray, 24)) ? fFormatNumber(array.get(accountingArray, 24), 2) : "-",  // Payoff ratio
+         not na(array.get(accountingArray, 16)) ? fFormatNumber(array.get(accountingArray, 16), 2) + ' %' : "-",  // Win rate
+         not na(array.get(accountingArray, 23)) ? fFormatNumber(array.get(accountingArray, 23), 2) + " % Risk" : "-",  // Expectancy
+         not na(array.get(accountingArray, 19)) ? fFormatNumber(array.get(accountingArray, 19), 2) + ' %' : "-",  // Max drawdown
+         not na(array.get(accountingArray, 20)) ? fFormatNumber(array.get(accountingArray, 20), 2) + ' ' + syminfo.currency : "-",  // Commission paid
+         LongTradeStr,  // Long stats
+         ShortTradeStr,  // Short stats
+         not na(array.get(accountingArray, 18)) ? tfString(int(array.get(accountingArray, 18))) : "-",  // Time active
+         not na(array.get(accountingArray, 25)) ? fFormatNumber(array.get(accountingArray, 25), 0) + " USDT" : "-",  // Monthly volume
+         not na(array.get(accountingArray, 21)) ? fFormatNumber(array.get(accountingArray, 21), 2) + ' ' + syminfo.currency : "-"  // Min capital required
+     )
+
+// Function to define all panel labels (left column)
+fGetPanelLabels() =>
+    array.from(
+         " Asset Type:",
+         " Equity:",
+         " Available Cash:",
+         " Used Margin:",
+         " Net Profit:",
+         " Raw Net Profit:",
+         " Floating PnL:",
+         " ROI:",
+         " Long Pos Size:",
+         " Avg Long Price:",
+         " Short Pos Size:",
+         " Avg Short Price:",
+         " Leverage:",
+         " Liquidation:",
+         holdLabel,
+         " Hold Efficiency:",
+         " Profit Factor:",
+         " Payoff Ratio:",
+         " Win Rate:",
+         " Expectancy:",
+         " Max Drawdown:",
+         " Commission Paid:",
+         " Long Trades:",
+         " Short Trades:",
+         " Time Trading:",
+         " Volume / Month:",
+         " Min Capital:")
+
+if ShowPanel
+    // Use the extracted helper functions
+    string[] labels = fGetPanelLabels()
+    string[] values = fGetPanelValues()
+    color[] colors = fGetPanelColors()
+
+    // Automatically set the panel row count to match the labels array size
+    int rowCount = array.size(labels)
+
+    // Declare the info panel table only once
+    var table InfoPanel = na
+    if na(InfoPanel)
+        InfoPanel := table.new(position.middle_left, 2, rowCount, na, color.new(color.black, 95), 1, color.new(color.black, 95), 1)
+
+    // Ensure consistency in array lengths before rendering
+    int panelSize = math.min(math.min(array.size(labels), array.size(values)), array.size(colors))
+
+    // Loop through and render every label-value pair to the info panel
+    for i = 0 to panelSize - 1
+        table.cell(InfoPanel, 0, i, array.get(labels, i),
+             text_color = color.new(color.white, 10),
+             text_halign = text.align_left,
+             text_size = fTextSize(PanelSizeInput),
+             bgcolor = color.new(color.black, 95))
+        table.cell(InfoPanel, 1, i, array.get(values, i),
+             text_color = color.new(color.white, 10),
+             text_halign = text.align_left,
+             text_size = fTextSize(PanelSizeInput),
+             bgcolor = array.get(colors, i))
+
+// Happy trading! 🚀💰
